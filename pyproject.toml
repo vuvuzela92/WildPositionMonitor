@@ -19,12 +19,11 @@ dependencies = [
 ]
 
 [project.scripts]
-wild-monitor = "scripts.run_monitor:main"
-wild-test-db = "scripts.test_db:main"
+wild-monitor = "src.main:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["wildpositionmonitor"]
+packages = ["src"]
