@@ -1,5 +1,5 @@
 [project]
-name = "wildpositionmonitor"
+name = "WildPositionMonitor"
 version = "0.1.0"
 description = "Система мониторинга позиций товаров Wildberries в списках похожих товаров"
 requires-python = ">=3.12"
