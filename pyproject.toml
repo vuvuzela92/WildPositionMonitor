@@ -1,0 +1,30 @@
+[project]
+name = "wildpositionmonitor"
+version = "0.1.0"
+description = "Система мониторинга позиций товаров Wildberries в списках похожих товаров"
+requires-python = ">=3.12"
+readme = "README.md"
+license = {text = "MIT"}
+dependencies = [
+    "aiohttp>=3.9.1",
+    "psycopg2-binary>=2.9.9",
+    "asyncpg>=0.29.0",
+    "python-dotenv>=1.0.1",
+    "clickhouse-driver>=0.2.6",
+    "loguru>=0.7.2",
+    "aiofiles>=23.2.1",
+    "pandas>=2.1.3",
+    "openpyxl>=3.1.2",
+    "numpy>=1.26.2",
+]
+
+[project.scripts]
+wild-monitor = "scripts.run_monitor:main"
+wild-test-db = "scripts.test_db:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["wildpositionmonitor"]
