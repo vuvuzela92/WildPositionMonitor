@@ -3,7 +3,7 @@
 """
 
 import asyncio
-from typing import Dict, List, Optional, Any, Tuple, Set
+from typing import Dict, Optional, Any, Tuple, Set
 
 import aiohttp
 from loguru import logger
@@ -22,7 +22,7 @@ class WildberriesService:
     def __init__(self):
         self.session = None
         self.logger = logger
-        self.semaphore = None  # Семафор для ограничения одновременных запросов
+        self.semaphore = None
 
     async def initialize(self):
         """Инициализация сервиса"""
@@ -38,20 +38,17 @@ class WildberriesService:
     async def _make_request(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Выполняет асинхронный запрос к API с повторными попытками
-        
         Args:
             url: URL для запроса
             params: Параметры запроса
-            
         Returns:
             Optional[Dict[str, Any]]: Ответ API в виде словаря или None в случае ошибки
         """
         retries = 0
         while retries < WB_MAX_RETRIES:
             try:
-                # Используем семафор для ограничения одновременных запросов
                 async with self.semaphore:
-                    async with self.session.get(url, params=params,ssl=False) as response:
+                    async with self.session.get(url, params=params, ssl=False) as response:
                         if response.status == 200:
                             return await response.json()
                         self.logger.warning(f"Статус {response.status} при запросе API")
@@ -61,7 +58,6 @@ class WildberriesService:
             except Exception as e:
                 self.logger.error(f"Ошибка при запросе API: {e}")
 
-            # Увеличиваем задержку между попытками
             retries += 1
             if retries < WB_MAX_RETRIES:
                 delay = WB_RETRY_DELAY * retries
@@ -73,10 +69,8 @@ class WildberriesService:
     async def get_product_details(self, product_id: int) -> Optional[ProductDetails]:
         """
         Получает информацию о товаре по его ID
-        
         Args:
             product_id: ID товара
-            
         Returns:
             Optional[ProductDetails]: Информация о товаре или None в случае ошибки
         """
@@ -95,16 +89,13 @@ class WildberriesService:
             if not response_data:
                 return None
 
-            # Извлекаем данные о товаре
             if ('data' in response_data and 'products' in response_data['data']
                     and len(response_data['data']['products']) > 0):
                 product = response_data['data']['products'][0]
-
-                # Получаем цену
                 price = None
                 if product.get('sizes') and len(product['sizes']) > 0:
                     price_data = product['sizes'][0].get('price', {})
-                    price = price_data.get('total')
+                    price = price_data.get('total') // 100 if price_data.get('total') else price_data.get('total')
 
                 return ProductDetails(
                     id=product['id'],
@@ -122,10 +113,8 @@ class WildberriesService:
     async def get_similar_products(self, product_details: ProductDetails) -> SimilarProductsResult:
         """
         Получает список похожих товаров
-        
         Args:
             product_details: Информация о товаре
-            
         Returns:
             SimilarProductsResult: Результат запроса похожих товаров
         """
@@ -148,7 +137,6 @@ class WildberriesService:
                 "curr": "rub",
                 "dest": WB_DEFAULT_DEST
             }
-
             response_data = await self._make_request(WB_SIMILAR_URL, params)
             if not response_data:
                 return SimilarProductsResult(
@@ -156,8 +144,6 @@ class WildberriesService:
                     similar_products=[],
                     error="Не удалось получить данные о похожих товарах"
                 )
-
-            # Извлекаем список похожих товаров
             similar_products = []
             if 'data' in response_data and 'products' in response_data['data']:
                 similar_products = response_data['data']['products']
@@ -185,19 +171,15 @@ class WildberriesService:
     ) -> Tuple[Optional[int], Optional[int]]:
         """
         Находит наш артикул среди похожих товаров
-        
         Args:
             similar_result: Результат запроса похожих товаров
             our_articles: Множество наших артикулов
-            
         Returns:
             Tuple[Optional[int], Optional[int]]: (найденный артикул, позиция)
         """
-        # Проверка на None и ошибки
         if not similar_result or similar_result.error or not similar_result.similar_products or not our_articles:
             return None, None
 
-        # Поиск наших артикулов среди похожих
         for position, product in enumerate(similar_result.similar_products, 1):
             product_id = product.get('id')
             if product_id in our_articles:
