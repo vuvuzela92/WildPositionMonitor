@@ -11,7 +11,7 @@ from loguru import logger
 from src.config import (
     POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
     CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DB,
-    BATCH_SIZE
+    BATCH_SIZE, DATA_SOURCE, GOOGLE_SHEET_NAME
 )
 from src.logger import setup_logger
 from src.db.postgres_client import PostgresClient
@@ -19,6 +19,7 @@ from src.db.clickhouse_client import ClickHouseClient
 from src.services.wb_service import WildberriesService
 from src.data_models import ProcessingResult
 from src.utils.excel_reader import ExcelReader
+from src.utils.google_sheets_reader import GoogleSheetsReader
 
 
 class WildPosition:
@@ -196,7 +197,11 @@ class WildPosition:
 
 # Точка входа
 async def main():
-    articles = ExcelReader().get_articles_from_file()
+    articles = GoogleSheetsReader().get_articles_from_sheet(GOOGLE_SHEET_NAME)
+    if not articles:
+        logger.error("Не удалось получить список артикулов. Завершение программы.")
+        return
+        
     await WildPosition().run(articles)
 
 

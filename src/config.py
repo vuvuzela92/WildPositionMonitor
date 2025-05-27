@@ -19,6 +19,15 @@ EXCEL_DIR = os.getenv("EXCEL_DIR", os.path.join(BASE_DIR, 'excel_files'))
 # Путь к конкретному Excel файлу с артикулами
 EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", os.path.join(EXCEL_DIR, 'Артикул.xlsx'))
 
+# Источник данных (excel или google_sheets)
+DATA_SOURCE = os.getenv("DATA_SOURCE", "excel")
+
+# Название Google таблицы
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Конкурентный анализ Вектор")
+
+# Путь к файлу с учетными данными для Google Sheets
+GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", os.path.join(BASE_DIR, 'creds.json'))
+
 LOG_FILE = "wild_position_monitor.log"
 
 # ClickHouse конфигурация
@@ -47,3 +56,7 @@ WB_RETRY_DELAY = 2  # секунды
 BATCH_SIZE = 20  # Размер батча для обработки артикулов
 CONCURRENT_REQUESTS_LIMIT = 10  # Максимальное количество одновременных запросов к API
 DB_POOL_SIZE = 5  # Размер пула соединений с базой данных
+
+# Параметры Google Sheets
+GOOGLE_MAX_RETRIES = 10  # Максимальное количество попыток подключения к Google Sheets
+GOOGLE_RETRY_DELAY = 3  # Задержка между попытками подключения (секунды)
