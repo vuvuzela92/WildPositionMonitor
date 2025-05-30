@@ -117,11 +117,11 @@ class GoogleSheetsReader:
             self.logger.info(f"Успешно прочитана Google таблица: {sheet_name}")
             self.logger.info(f"Количество строк: {len(df)}")
 
-            if 'Артикул' not in df.columns:
-                self.logger.error(f"Столбец 'Артикул' не найден в таблице. Доступные столбцы: {', '.join(df.columns)}")
+            if 'Артикул конкурента' not in df.columns:
+                self.logger.error(f"Столбец 'Артикул конкурента' не найден в таблице. Доступные столбцы: {', '.join(df.columns)}")
                 return []
 
-            df['Артикул'] = pd.to_numeric(df['Артикул'], errors='coerce')
+            df['Артикул'] = pd.to_numeric(df['Артикул конкурента'], errors='coerce')
 
             articles = df['Артикул'].dropna().astype('int64').unique().tolist()
 
