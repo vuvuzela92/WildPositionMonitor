@@ -95,7 +95,7 @@ class WildberriesService:
                 price = None
                 if product.get('sizes') and len(product['sizes']) > 0:
                     price_data = product['sizes'][0].get('price', {})
-                    price = price_data.get('total') // 100 if price_data.get('total') else price_data.get('total')
+                    price = price_data.get('product') // 100 if price_data.get('product') else price_data.get('product')
 
                 return ProductDetails(
                     id=product['id'],
