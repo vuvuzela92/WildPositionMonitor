@@ -87,14 +87,16 @@ class ClickHouseClient:
                     result.price,
                     result.found_article,
                     result.position,
-                    result.processed_at
+                    result.processed_at,
+                    result.wild,
+                    result.concurrent
                 ))
 
             # Выполняем вставку всех данных одним запросом
             self.client.execute(
                 """
                 INSERT INTO product_positions 
-                (article_id, price, found_article, position, processed_at) 
+                (article_id, price, found_article, position, processed_at, wild, concurrent) 
                 VALUES
                 """,
                 records

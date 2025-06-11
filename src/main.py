@@ -53,12 +53,12 @@ class WildPosition:
         # Сервис Wildberries (асинхронный)
         self.wb_service = WildberriesService()
     
-    async def run(self, articles: List[int]) -> bool:
+    async def run(self, articles_data: List[Dict[str, Any]]) -> bool:
         """
         Запускает процесс мониторинга для списка артикулов
         
         Args:
-            articles: Список артикулов для обработки
+            articles_data: Список словарей с информацией об артикулах
             
         Returns:
             bool: True в случае успеха, False в случае ошибки
@@ -88,10 +88,10 @@ class WildPosition:
             
             # Обработка артикулов батчами
             all_results = []
-            for i in range(0, len(articles), BATCH_SIZE):
-                batch = articles[i:i + BATCH_SIZE]
+            for i in range(0, len(articles_data), BATCH_SIZE):
+                batch = articles_data[i:i + BATCH_SIZE]
                 batch_num = i//BATCH_SIZE + 1
-                total_batches = (len(articles) + BATCH_SIZE - 1)//BATCH_SIZE
+                total_batches = (len(articles_data) + BATCH_SIZE - 1)//BATCH_SIZE
                 
                 self.logger.info(f"Обработка батча {batch_num}/{total_batches} ({len(batch)} артикулов)")
                 
@@ -119,33 +119,37 @@ class WildPosition:
         # Синхронное закрытие
         self.clickhouse_client.close()
     
-    async def _process_batch(self, articles: List[int], our_articles: Set[int]) -> List[ProcessingResult]:
+    async def _process_batch(self, articles_data: List[Dict[str, Any]], our_articles: Set[int]) -> List[ProcessingResult]:
         """
         Асинхронная обработка батча артикулов
         
         Args:
-            articles: Список артикулов для обработки
+            articles_data: Список словарей с информацией об артикулах
             our_articles: Множество наших артикулов
             
         Returns:
             List[ProcessingResult]: Список результатов обработки
         """
         # Используем gather для параллельной обработки артикулов в батче
-        tasks = [self._process_single_article(article_id, our_articles) for article_id in articles]
+        tasks = [self._process_single_article(article_info, our_articles) for article_info in articles_data]
         results = await asyncio.gather(*tasks)
         return results
     
-    async def _process_single_article(self, article_id: int, our_articles: Set[int]) -> ProcessingResult:
+    async def _process_single_article(self, article_info: Dict[str, Any], our_articles: Set[int]) -> ProcessingResult:
         """
         Асинхронная обработка одного артикула
         
         Args:
-            article_id: ID артикула
+            article_info: Словарь с информацией об артикуле
             our_articles: Множество наших артикулов
             
         Returns:
             ProcessingResult: Результат обработки
         """
+        article_id = article_info['article_id']
+        wild_value = article_info.get('wild', '')
+        competitor_status = article_info.get('competitor_status', '')
+        
         try:
             # Получаем данные о товаре
             product = await self.wb_service.get_product_details(article_id)
@@ -153,7 +157,9 @@ class WildPosition:
                 return ProcessingResult(
                     article_id=article_id,
                     error="Товар не найден",
-                    processed_at=datetime.now()
+                    processed_at=datetime.now(),
+                    wild=wild_value,
+                    concurrent=competitor_status
                 )
             
             # Запоминаем цену
@@ -166,7 +172,9 @@ class WildPosition:
                     article_id=article_id,
                     price=price,
                     error=similar.error,
-                    processed_at=datetime.now()
+                    processed_at=datetime.now(),
+                    wild=wild_value,
+                    concurrent=competitor_status
                 )
             
             # Проверяем наличие наших артикулов среди похожих (синхронная операция)
@@ -182,7 +190,9 @@ class WildPosition:
                 price=price,
                 found_article=found_id,
                 position=position,
-                processed_at=datetime.now()
+                processed_at=datetime.now(),
+                wild=wild_value,
+                concurrent=competitor_status
             )
             
         except Exception as e:
@@ -190,19 +200,21 @@ class WildPosition:
             return ProcessingResult(
                 article_id=article_id,
                 error=str(e),
-                processed_at=datetime.now()
+                processed_at=datetime.now(),
+                wild=wild_value,
+                concurrent=competitor_status
             )
 
 
 
 # Точка входа
 async def main():
-    articles = GoogleSheetsReader().get_articles_from_sheet(GOOGLE_SHEET_NAME)
-    if not articles:
+    articles_data = GoogleSheetsReader().get_articles_from_sheet(GOOGLE_SHEET_NAME)
+    if not articles_data:
         logger.error("Не удалось получить список артикулов. Завершение программы.")
         return
         
-    await WildPosition().run(articles)
+    await WildPosition().run(articles_data)
 
 
 if __name__ == "__main__":

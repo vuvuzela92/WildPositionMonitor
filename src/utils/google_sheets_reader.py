@@ -1,7 +1,7 @@
 """
 Модуль для работы с Google Sheets и извлечения данных
 """
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, Dict
 import os
 import time
 from gspread import Client, service_account, Worksheet
@@ -93,13 +93,13 @@ class GoogleSheetsReader:
                     self.logger.error(error_msg)
                     return None, error_msg
     
-    def get_articles_from_sheet(self, sheet_name: Optional[str] = None) -> List[int]:
+    def get_articles_from_sheet(self, sheet_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Получает список артикулов из столбца 'Артикул' в Google Таблице
+        Получает список артикулов и дополнительной информации из Google Таблицы
         Args:
             sheet_name: Опциональное название таблицы (если None, используется SHEET_NAME)
         Returns:
-            List[int]: Список артикулов
+            List[Dict[str, Any]]: Список словарей с информацией об артикулах и дополнительных полях
         """
         if sheet_name is None:
             sheet_name = self.sheet_name
@@ -121,17 +121,39 @@ class GoogleSheetsReader:
                 self.logger.error(f"Столбец 'Артикул конкурента' не найден в таблице. Доступные столбцы: {', '.join(df.columns)}")
                 return []
 
+            # Проверяем наличие необходимых столбцов
+            if 'wild' not in df.columns:
+                self.logger.warning(f"Столбец 'wild' не найден в таблице. Будет использовано значение по умолчанию.")
+            
+            if 'Статус конкурента' not in df.columns:
+                self.logger.warning(f"Столбец 'Статус конкурента' не найден в таблице. Будет использовано значение по умолчанию.")
+            
+            # Преобразуем столбец с артикулами к числовому типу
             df['Артикул'] = pd.to_numeric(df['Артикул конкурента'], errors='coerce')
-
-            articles = df['Артикул'].dropna().astype('int64').unique().tolist()
-
-            if not articles:
+            
+            # Отбрасываем строки с NaN в столбце Артикул
+            df = df.dropna(subset=['Артикул'])
+            
+            # Преобразуем артикулы к целочисленному типу
+            df['Артикул'] = df['Артикул'].astype('int64')
+            
+            if len(df) == 0:
                 self.logger.warning("Не найдено числовых артикулов в таблице")
                 return []
+            
+            # Создаем список словарей с артикулами и дополнительной информацией
+            result = []
+            for _, row in df.iterrows():
+                article_info = {
+                    'article_id': int(row['Артикул']),
+                    'wild': row.get('wild', '') if 'wild' in df.columns else '',
+                    'competitor_status': row.get('Статус конкурента', '') if 'Статус конкурента' in df.columns else ''
+                }
+                result.append(article_info)
                 
-            self.logger.info(f"Найдено {len(articles)} уникальных артикулов в Google таблице")
+            self.logger.info(f"Найдено {len(result)} артикулов в Google таблице")
                 
-            return articles
+            return result
             
         except Exception as e:
             self.logger.error(f"Ошибка при чтении Google таблицы {sheet_name}: {e}")

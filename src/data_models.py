@@ -33,3 +33,5 @@ class ProcessingResult:
     position: Optional[int] = None
     processed_at: datetime = field(default_factory=datetime.now)
     error: Optional[str] = None
+    wild: Optional[str] = None
+    concurrent: Optional[str] = None
