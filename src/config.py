@@ -47,7 +47,7 @@ POSTGRES_DB = os.getenv("POSTGRES_DB")
 # Wildberries API параметры
 WB_DETAIL_URL = "https://card.wb.ru/cards/v2/detail"
 WB_SIMILAR_URL = "https://recom.wb.ru/recom/ru/common/v5/search"
-WB_DEFAULT_DEST = "-5892277"
+WB_DEFAULT_DEST = "-1255987"
 WB_TIMEOUT = 10  # секунды
 WB_MAX_RETRIES = 3
 WB_RETRY_DELAY = 2  # секунды
