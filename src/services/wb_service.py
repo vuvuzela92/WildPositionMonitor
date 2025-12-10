@@ -10,7 +10,7 @@ from loguru import logger
 
 from src.config import (
     WB_DETAIL_URL, WB_SIMILAR_URL, WB_DEFAULT_DEST,
-    WB_TIMEOUT, WB_MAX_RETRIES, WB_RETRY_DELAY,
+    WB_TIMEOUT, WB_MAX_RETRIES, WB_RETRY_DELAY, WB_RATE_LIMIT_DELAY,
     CONCURRENT_REQUESTS_LIMIT
 )
 from src.data_models import ProductDetails, SimilarProductsResult
@@ -51,8 +51,18 @@ class WildberriesService:
                     async with self.session.get(url, params=params, ssl=False) as response:
                         if response.status == 200:
                             return await response.json()
-                        self.logger.warning(f"Статус {response.status} при запросе API")
-                        return None
+                        elif response.status == 429:
+                            # Rate limit - увеличенная задержка
+                            self.logger.warning(
+                                f"Статус 429 (Rate Limit) при запросе API. "
+                                f"Ожидание {WB_RATE_LIMIT_DELAY} секунд..."
+                            )
+                            await asyncio.sleep(WB_RATE_LIMIT_DELAY)
+                            retries += 1
+                            continue
+                        else:
+                            self.logger.warning(f"Статус {response.status} при запросе API")
+                            return None
             except asyncio.TimeoutError:
                 self.logger.warning(f"Таймаут при запросе {url}")
             except Exception as e:
@@ -68,7 +78,7 @@ class WildberriesService:
 
     async def get_product_details(self, product_id: int) -> Optional[ProductDetails]:
         """
-        Получает информацию о товаре по его ID
+        Получает информацию о товаре по его ID через API v4
         Args:
             product_id: ID товара
         Returns:
@@ -79,8 +89,9 @@ class WildberriesService:
             "curr": "rub",
             "dest": WB_DEFAULT_DEST,
             "spp": 30,
+            "hide_vflags": 4294967296,
+            "hide_dtype": "9;11",
             "ab_testing": "false",
-            "lang": "ru",
             "nm": product_id
         }
 
@@ -89,23 +100,30 @@ class WildberriesService:
             if not response_data:
                 return None
 
-            if ('data' in response_data and 'products' in response_data['data']
-                    and len(response_data['data']['products']) > 0):
-                product = response_data['data']['products'][0]
-                price = None
-                if product.get('sizes') and len(product['sizes']) > 0:
-                    price_data = product['sizes'][0].get('price', {})
-                    price = price_data.get('product') // 100 if price_data.get('product') else price_data.get('product')
+            # API v4 возвращает products напрямую (не в data.products)
+            products = response_data.get('products', [])
+            if not products or len(products) == 0:
+                self.logger.warning(f"Товар {product_id} не найден в ответе API")
+                return None
 
-                return ProductDetails(
-                    id=product['id'],
-                    name=product.get('name', ''),
-                    brand=product.get('brand', ''),
-                    price=price,
-                    raw_data=product
-                )
+            product = products[0]
 
-            return None
+            # Извлекаем цену из sizes[0].price.product
+            price = None
+            if product.get('sizes') and len(product['sizes']) > 0:
+                price_data = product['sizes'][0].get('price', {})
+                product_price_kopecks = price_data.get('product')
+                if product_price_kopecks:
+                    price = product_price_kopecks // 100
+
+            return ProductDetails(
+                id=product['id'],
+                name=product.get('name', ''),
+                brand=product.get('brand', ''),
+                price=price,
+                raw_data=product
+            )
+
         except Exception as e:
             self.logger.error(f"Ошибка при получении данных о товаре {product_id}: {e}")
             return None

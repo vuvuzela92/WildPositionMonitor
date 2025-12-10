@@ -45,12 +45,13 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 POSTGRES_DB = os.getenv("POSTGRES_DB")
 
 # Wildberries API параметры
-WB_DETAIL_URL = "https://card.wb.ru/cards/v2/detail"
+WB_DETAIL_URL = "https://card.wb.ru/cards/v4/detail"
 WB_SIMILAR_URL = "https://recom.wb.ru/recom/ru/common/v5/search"
 WB_DEFAULT_DEST = "-1255987"
 WB_TIMEOUT = 10  # секунды
 WB_MAX_RETRIES = 3
 WB_RETRY_DELAY = 2  # секунды
+WB_RATE_LIMIT_DELAY = 60  # секунды задержки при получении 429 статуса
 
 # Параметры асинхронной обработки
 BATCH_SIZE = 100  # Размер батча для обработки артикулов
