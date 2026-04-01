@@ -23,6 +23,8 @@ log/
 
 # Секретные данные
 .env
+creds.json
+uv.lock
 
 # Данные
 input/
