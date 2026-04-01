@@ -48,6 +48,7 @@ class WildberriesService:
         """Закрытие сервиса"""
         if self.session:
             self.session.close()
+            self.logger.info("Сессия Wildberries успешно закрыта")
 
     # async def _make_request(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     #     """

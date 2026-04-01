@@ -3,6 +3,7 @@
 """
 
 import asyncio
+from asyncio import to_thread
 from datetime import datetime
 from typing import List, Set, Dict, Any, Optional
 
@@ -100,7 +101,8 @@ class WildPosition:
                 all_results.extend(batch_results)
                 
                 # Синхронное сохранение результатов батча в ClickHouse
-                self.clickhouse_client.save_results(batch_results)
+                # self.clickhouse_client.save_results(batch_results)
+                await to_thread(self.clickhouse_client.save_results, batch_results)
 
             
         except Exception as e:
