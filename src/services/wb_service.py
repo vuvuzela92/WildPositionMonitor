@@ -5,7 +5,8 @@
 import asyncio
 from typing import Dict, Optional, Any, Tuple, Set
 
-import aiohttp
+# import aiohttp
+from curl_cffi.requests import AsyncSession
 from loguru import logger
 
 from src.config import (
@@ -24,56 +25,96 @@ class WildberriesService:
         self.logger = logger
         self.semaphore = None
 
+    # async def initialize(self):
+    #     """Инициализация сервиса"""
+    #     self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=WB_TIMEOUT))
+    #     self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
+    #     self.logger.info("Инициализирован сервис Wildberries")
+
+    # async def close(self):
+    #     """Закрытие сервиса"""
+    #     if self.session:
+    #         await self.session.close()
+
+
     async def initialize(self):
-        """Инициализация сервиса"""
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=WB_TIMEOUT))
+        """Инициализация сервиса с эмуляцией браузера"""
+        # impersonate="chrome120" — это магия, которая обходит 403 ошибку
+        self.session = AsyncSession(impersonate="chrome120", timeout=WB_TIMEOUT)
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
-        self.logger.info("Инициализирован сервис Wildberries")
+        self.logger.info("Инициализирован сервис Wildberries (TLS Impersonation: Chrome)")
 
     async def close(self):
         """Закрытие сервиса"""
         if self.session:
-            await self.session.close()
+            self.session.close()
+
+    # async def _make_request(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    #     """
+    #     Выполняет асинхронный запрос к API с повторными попытками
+    #     Args:
+    #         url: URL для запроса
+    #         params: Параметры запроса
+    #     Returns:
+    #         Optional[Dict[str, Any]]: Ответ API в виде словаря или None в случае ошибки
+    #     """
+    #     retries = 0
+    #     while retries < WB_MAX_RETRIES:
+    #         try:
+    #             async with self.semaphore:
+    #                 async with self.session.get(url, params=params, ssl=False) as response:
+    #                     if response.status == 200:
+    #                         return await response.json()
+    #                     elif response.status == 429:
+    #                         # Rate limit - увеличенная задержка
+    #                         self.logger.warning(
+    #                             f"Статус 429 (Rate Limit) при запросе API. "
+    #                             f"Ожидание {WB_RATE_LIMIT_DELAY} секунд..."
+    #                         )
+    #                         await asyncio.sleep(WB_RATE_LIMIT_DELAY)
+    #                         retries += 1
+    #                         continue
+    #                     else:
+    #                         self.logger.warning(f"Статус {response.status} при запросе API")
+    #                         return None
+    #         except asyncio.TimeoutError:
+    #             self.logger.warning(f"Таймаут при запросе {url}")
+    #         except Exception as e:
+    #             self.logger.error(f"Ошибка при запросе API: {e}")
+
+    #         retries += 1
+    #         if retries < WB_MAX_RETRIES:
+    #             delay = WB_RETRY_DELAY * retries
+    #             await asyncio.sleep(delay)
+
+    #     self.logger.error(f"Исчерпаны попытки для запроса API")
+    #     return None
 
     async def _make_request(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Выполняет асинхронный запрос к API с повторными попытками
-        Args:
-            url: URL для запроса
-            params: Параметры запроса
-        Returns:
-            Optional[Dict[str, Any]]: Ответ API в виде словаря или None в случае ошибки
-        """
         retries = 0
         while retries < WB_MAX_RETRIES:
             try:
                 async with self.semaphore:
-                    async with self.session.get(url, params=params, ssl=False) as response:
-                        if response.status == 200:
-                            return await response.json()
-                        elif response.status == 429:
-                            # Rate limit - увеличенная задержка
-                            self.logger.warning(
-                                f"Статус 429 (Rate Limit) при запросе API. "
-                                f"Ожидание {WB_RATE_LIMIT_DELAY} секунд..."
-                            )
-                            await asyncio.sleep(WB_RATE_LIMIT_DELAY)
-                            retries += 1
-                            continue
-                        else:
-                            self.logger.warning(f"Статус {response.status} при запросе API")
-                            return None
-            except asyncio.TimeoutError:
-                self.logger.warning(f"Таймаут при запросе {url}")
+                    # У curl_cffi вызываем get напрямую у сессии
+                    response = await self.session.get(url, params=params)
+                    
+                    if response.status_code == 200:
+                        return response.json()
+                    elif response.status_code == 429:
+                        self.logger.warning(f"Rate Limit. Ждем {WB_RATE_LIMIT_DELAY}с...")
+                        await asyncio.sleep(WB_RATE_LIMIT_DELAY)
+                        retries += 1
+                        continue
+                    else:
+                        self.logger.warning(f"Статус {response.status_code} при запросе API")
+                        return None
             except Exception as e:
                 self.logger.error(f"Ошибка при запросе API: {e}")
 
             retries += 1
             if retries < WB_MAX_RETRIES:
-                delay = WB_RETRY_DELAY * retries
-                await asyncio.sleep(delay)
+                await asyncio.sleep(WB_RETRY_DELAY * retries)
 
-        self.logger.error(f"Исчерпаны попытки для запроса API")
         return None
 
     async def get_product_details(self, product_id: int) -> Optional[ProductDetails]:
@@ -88,10 +129,10 @@ class WildberriesService:
             "appType": 1,
             "curr": "rub",
             "dest": WB_DEFAULT_DEST,
-            "spp": 30,
-            "hide_vflags": 4294967296,
-            "hide_dtype": "9;11",
-            "ab_testing": "false",
+            # "spp": 30,
+            # "hide_vflags": 4294967296,
+            # "hide_dtype": "9;11",
+            # "ab_testing": "false",
             "nm": product_id
         }
 
