@@ -14,7 +14,6 @@ from src.config import (
     CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DB,
     BATCH_SIZE, DATA_SOURCE, GOOGLE_SHEET_NAME
 )
-from src.logger import setup_logger
 from src.db.postgres_client import PostgresClient
 from src.db.clickhouse_client import ClickHouseClient
 from src.services.wb_service import WildberriesService
@@ -31,9 +30,7 @@ class WildPosition:
     __instance = None
 
     def __init__(self):
-        setup_logger()
-        self.logger = logger
-        
+
         # Создаем клиенты баз данных
         self.postgres_client = PostgresClient({
             'host': POSTGRES_HOST,
@@ -55,7 +52,7 @@ class WildPosition:
         # Сервис Wildberries (асинхронный)
         self.wb_service = WildberriesService()
     
-    async def run(self, articles_data: List[Dict[str, Any]]) -> bool:
+    async def run(self, articles_data: List[Dict[str, Any]]) -> bool | None:
         """
         Запускает процесс мониторинга для списка артикулов
         
@@ -65,17 +62,17 @@ class WildPosition:
         Returns:
             bool: True в случае успеха, False в случае ошибки
         """
-        self.logger.info("Запуск мониторинга товаров Wildberries")
+        logger.info("Запуск мониторинга товаров Wildberries")
         
         try:
             # Асинхронное подключение к PostgreSQL
             if not await self.postgres_client.connect():
-                self.logger.error("Ошибка подключения к PostgreSQL")
+                logger.error("Ошибка подключения к PostgreSQL")
                 return False
                 
             # Синхронное подключение к ClickHouse
             if not self.clickhouse_client.connect():
-                self.logger.error("Ошибка подключения к ClickHouse")
+                logger.error("Ошибка подключения к ClickHouse")
                 return False
 
             
@@ -85,7 +82,7 @@ class WildPosition:
             # Получаем список наших артикулов (асинхронно)
             our_articles = await self.postgres_client.get_our_articles()
             if not our_articles:
-                self.logger.error("Не удалось получить список наших артикулов")
+                logger.error("Не удалось получить список наших артикулов")
                 return False
             
             # Обработка артикулов батчами
@@ -95,7 +92,7 @@ class WildPosition:
                 batch_num = i//BATCH_SIZE + 1
                 total_batches = (len(articles_data) + BATCH_SIZE - 1)//BATCH_SIZE
                 
-                self.logger.info(f"Обработка батча {batch_num}/{total_batches} ({len(batch)} артикулов)")
+                logger.info(f"Обработка батча {batch_num}/{total_batches} ({len(batch)} артикулов)")
                 
                 # Асинхронная обработка батча
                 batch_results = await self._process_batch(batch, our_articles)
@@ -107,7 +104,7 @@ class WildPosition:
 
             
         except Exception as e:
-            self.logger.error(f"Ошибка: {e}")
+            logger.error(f"Ошибка: {e}")
             return False
         finally:
             # Закрываем соединения
@@ -185,7 +182,7 @@ class WildPosition:
             
             # Если нашли, выводим информацию
             if found_id:
-                self.logger.info(f"Найден артикул {found_id} на позиции {position}")
+                logger.info(f"Найден артикул {found_id} на позиции {position}")
             
             # Возвращаем результат
             return ProcessingResult(
@@ -199,7 +196,7 @@ class WildPosition:
             )
             
         except Exception as e:
-            self.logger.error(f"Ошибка обработки артикула {article_id}: {e}")
+            logger.error(f"Ошибка обработки артикула {article_id}: {e}")
             return ProcessingResult(
                 article_id=article_id,
                 error=str(e),
