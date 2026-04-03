@@ -28,7 +28,8 @@ class WildPosition:
     Класс для мониторинга позиций товаров Wildberries
     с асинхронной обработкой API запросов
     """
-    
+    __instance = None
+
     def __init__(self):
         setup_logger()
         self.logger = logger
@@ -207,7 +208,18 @@ class WildPosition:
                 concurrent=competitor_status
             )
 
+    def __new__(cls):
+        if not cls.__instance:
+            cls.__instance = super(WildPosition, cls).__new__(cls)
+        return cls.__instance
 
+    @staticmethod
+    def get_instance():
+        if not WildPosition.__instance:
+            WildPosition.__new__(WildPosition)
+        return WildPosition.__instance
+
+wild_position = WildPosition.get_instance()
 
 # Точка входа
 async def main():
@@ -215,8 +227,8 @@ async def main():
     if not articles_data:
         logger.error("Не удалось получить список артикулов. Завершение программы.")
         return
-        
-    await WildPosition().run(articles_data)
+
+    await wild_position.run(articles_data)
 
 
 if __name__ == "__main__":
