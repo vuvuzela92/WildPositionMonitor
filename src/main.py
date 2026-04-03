@@ -22,6 +22,27 @@ from src.utils.excel_reader import ExcelReader
 from src.utils.google_sheets_reader import GoogleSheetsReader
 
 
+
+psql_client = PostgresClient({
+            'host': POSTGRES_HOST,
+            'port': POSTGRES_PORT,
+            'user': POSTGRES_USER,
+            'password': POSTGRES_PASSWORD,
+            'database': POSTGRES_DB
+        })
+# ClickHouse клиент (полностью синхронный)
+click_client = ClickHouseClient({
+            'host': CLICKHOUSE_HOST,
+            'port': CLICKHOUSE_PORT,
+            'user': CLICKHOUSE_USER,
+            'password': CLICKHOUSE_PASSWORD,
+            'database': CLICKHOUSE_DB
+        })
+
+# Сервис Wildberries (асинхронный)
+wb_serv = WildberriesService()
+
+
 class WildPosition:
     """
     Класс для мониторинга позиций товаров Wildberries
@@ -29,28 +50,16 @@ class WildPosition:
     """
     __instance = None
 
-    def __init__(self):
+    def __init__(
+            self,
+            postgres_client: PostgresClient,
+            clickhouse_client: ClickHouseClient,
+            wb_service: WildberriesService
+    ) -> None:
 
-        # Создаем клиенты баз данных
-        self.postgres_client = PostgresClient({
-            'host': POSTGRES_HOST,
-            'port': POSTGRES_PORT,
-            'user': POSTGRES_USER,
-            'password': POSTGRES_PASSWORD,
-            'database': POSTGRES_DB
-        })
-        
-        # ClickHouse клиент (полностью синхронный)
-        self.clickhouse_client = ClickHouseClient({
-            'host': CLICKHOUSE_HOST,
-            'port': CLICKHOUSE_PORT,
-            'user': CLICKHOUSE_USER,
-            'password': CLICKHOUSE_PASSWORD,
-            'database': CLICKHOUSE_DB
-        })
-        
-        # Сервис Wildberries (асинхронный)
-        self.wb_service = WildberriesService()
+        self.postgres_client = postgres_client
+        self.clickhouse_client = clickhouse_client
+        self.wb_service = wb_service
     
     async def run(self, articles_data: List[Dict[str, Any]]) -> bool | None:
         """
@@ -205,9 +214,13 @@ class WildPosition:
                 concurrent=competitor_status
             )
 
-    def __new__(cls):
+    def __new__(cls, *args, **kwargs):
         if not cls.__instance:
-            cls.__instance = super(WildPosition, cls).__new__(cls)
+            cls.__instance = super(WildPosition, cls).__new__(cls, *args, **kwargs)
+            cls.__instance.__init__(
+                postgres_client=psql_client,
+                clickhouse_client=click_client,
+                wb_service=wb_serv)
         return cls.__instance
 
     @staticmethod
