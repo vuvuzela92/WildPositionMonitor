@@ -1,249 +1,459 @@
 """
-Асинхронный сервис для работы с Wildberries API
+Асинхронный сервис для работы с Wildberries API c базовой отказоустойчивостью.
 """
 
-import asyncio
-from typing import Dict, Optional, Any, Tuple, Set
+from __future__ import annotations
 
-# import aiohttp
+import asyncio
+import random
+import time
+from collections import deque
+from typing import Any, Dict, Optional, Set, Tuple
+
 from curl_cffi.requests import AsyncSession
 from loguru import logger
 
 from src.config import (
-    WB_DETAIL_URL, WB_SIMILAR_URL, WB_DEFAULT_DEST,
-    WB_TIMEOUT, WB_MAX_RETRIES, WB_RETRY_DELAY, WB_RATE_LIMIT_DELAY,
-    CONCURRENT_REQUESTS_LIMIT
+    CONCURRENT_REQUESTS_LIMIT,
+    WB_CIRCUIT_COOLDOWN,
+    WB_FORBIDDEN_THRESHOLD,
+    WB_MAX_RETRIES,
+    WB_MAX_RPS,
+    WB_RATE_LIMIT_DELAY,
+    WB_RETRY_DELAY,
+    WB_SIMILAR_URL,
+    WB_TIMEOUT,
 )
-from src.data_models import ProductDetails, SimilarProductsResult
+from src.data_models import ProductDetails, SimilarProductsResult, WBRequestResult
 
 
 class WildberriesService:
-    """Асинхронный сервис для работы с Wildberries API"""
-
-    def __init__(self):
-        self.session = None
+    def __init__(self) -> None:
+        self.session: Optional[AsyncSession] = None
         self.logger = logger
-        self.semaphore = None
-
-    # async def initialize(self):
-    #     """Инициализация сервиса"""
-    #     self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=WB_TIMEOUT))
-    #     self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
-    #     self.logger.info("Инициализирован сервис Wildberries")
-
-    # async def close(self):
-    #     """Закрытие сервиса"""
-    #     if self.session:
-    #         await self.session.close()
-
-
-    async def initialize(self):
-        """Инициализация сервиса с эмуляцией браузера"""
-        # impersonate="chrome120" — это магия, которая обходит 403 ошибку
-        self.session = AsyncSession(impersonate="chrome120", timeout=WB_TIMEOUT)
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
-        self.logger.info("Инициализирован сервис Wildberries (TLS Impersonation: Chrome)")
+        self.current_concurrency_limit = CONCURRENT_REQUESTS_LIMIT
+        self.max_retries = max(1, WB_MAX_RETRIES)
+        self.base_retry_delay = max(0.2, float(WB_RETRY_DELAY))
+        self.timeout = max(1, int(WB_TIMEOUT))
+        self.forbidden_threshold = max(1, WB_FORBIDDEN_THRESHOLD)
+        self.cooldown_seconds = max(10, int(WB_CIRCUIT_COOLDOWN or WB_RATE_LIMIT_DELAY))
+        self.consecutive_forbidden = 0
+        self.circuit_open_until = 0.0
+        self.max_rps = max(1, WB_MAX_RPS)
+        self.rps_window_seconds = 1.0
+        self._request_timestamps: deque[float] = deque()
+        self.default_headers: Dict[str, str] = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Connection": "keep-alive",
+            "Referer": "https://www.wildberries.ru/",
+        }
 
-    async def close(self):
-        """Закрытие сервиса"""
+    async def initialize(self) -> None:
+        """Инициализация сессии."""
+        self.session = AsyncSession(
+            impersonate="chrome124",
+            timeout=self.timeout,
+            headers=self.default_headers,
+        )
+        self.logger.info("Сервис WB инициализирован, создана постоянная async-сессия")
+
+    async def close(self) -> None:
         if self.session:
             self.session.close()
-            self.logger.info("Сессия Wildberries успешно закрыта")
+            self.logger.info("Сессия сервиса WB закрыта")
 
-    # async def _make_request(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    #     """
-    #     Выполняет асинхронный запрос к API с повторными попытками
-    #     Args:
-    #         url: URL для запроса
-    #         params: Параметры запроса
-    #     Returns:
-    #         Optional[Dict[str, Any]]: Ответ API в виде словаря или None в случае ошибки
-    #     """
-    #     retries = 0
-    #     while retries < WB_MAX_RETRIES:
-    #         try:
-    #             async with self.semaphore:
-    #                 async with self.session.get(url, params=params, ssl=False) as response:
-    #                     if response.status == 200:
-    #                         return await response.json()
-    #                     elif response.status == 429:
-    #                         # Rate limit - увеличенная задержка
-    #                         self.logger.warning(
-    #                             f"Статус 429 (Rate Limit) при запросе API. "
-    #                             f"Ожидание {WB_RATE_LIMIT_DELAY} секунд..."
-    #                         )
-    #                         await asyncio.sleep(WB_RATE_LIMIT_DELAY)
-    #                         retries += 1
-    #                         continue
-    #                     else:
-    #                         self.logger.warning(f"Статус {response.status} при запросе API")
-    #                         return None
-    #         except asyncio.TimeoutError:
-    #             self.logger.warning(f"Таймаут при запросе {url}")
-    #         except Exception as e:
-    #             self.logger.error(f"Ошибка при запросе API: {e}")
-
-    #         retries += 1
-    #         if retries < WB_MAX_RETRIES:
-    #             delay = WB_RETRY_DELAY * retries
-    #             await asyncio.sleep(delay)
-
-    #     self.logger.error(f"Исчерпаны попытки для запроса API")
-    #     return None
-
-    async def _make_request(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        retries = 0
-        while retries < WB_MAX_RETRIES:
-            try:
-                async with self.semaphore:
-                    # У curl_cffi вызываем get напрямую у сессии
-                    response = await self.session.get(url, params=params)
-                    
-                    if response.status_code == 200:
-                        return response.json()
-                    elif response.status_code == 429:
-                        self.logger.warning(f"Rate Limit. Ждем {WB_RATE_LIMIT_DELAY}с...")
-                        await asyncio.sleep(WB_RATE_LIMIT_DELAY)
-                        retries += 1
-                        continue
-                    else:
-                        self.logger.warning(f"Статус {response.status_code} при запросе API")
-                        return None
-            except Exception as e:
-                self.logger.error(f"Ошибка при запросе API: {e}")
-
-            retries += 1
-            if retries < WB_MAX_RETRIES:
-                await asyncio.sleep(WB_RETRY_DELAY * retries)
-
-        return None
-
-    async def get_product_details(self, product_id: int) -> Optional[ProductDetails]:
+    async def update_concurrency_limit(self, new_limit: int) -> None:
         """
-        Получает информацию о товаре по его ID через API v4
-        Args:
-            product_id: ID товара
-        Returns:
-            Optional[ProductDetails]: Информация о товаре или None в случае ошибки
+        Мягко изменяет лимит конкурентности, не ломая активные запросы.
+        """
+        if new_limit < 1:
+            new_limit = 1
+        if new_limit == self.current_concurrency_limit:
+            return
+        self.semaphore = asyncio.Semaphore(new_limit)
+        self.current_concurrency_limit = new_limit
+        self.logger.info("Лимит конкурентности WB обновлен: {}", new_limit)
+
+    async def get_product_details(self, product_id: int, request_id: str) -> WBRequestResult:
+        """
+        Получает данные товара из WB basket JSON endpoint.
+        """
+        basket_data = self._get_basket_data(product_id)
+        url = (
+            f"https://basket-{basket_data['basket']}.wbbasket.ru/"
+            f"vol{basket_data['vol']}/part{basket_data['part']}/{product_id}/info/ru/card.json"
+        )
+        return await self._request_with_retry(
+            url=url,
+            endpoint="basket_card",
+            request_id=request_id,
+            context={"article_id": product_id},
+        )
+
+    async def get_similar_products(
+        self,
+        product: ProductDetails,
+        request_id: str,
+    ) -> SimilarProductsResult:
+        """
+        Получает похожие товары через recom endpoint.
         """
         params = {
             "appType": 1,
             "curr": "rub",
-            "dest": WB_DEFAULT_DEST,
-            # "spp": 30,
-            # "hide_vflags": 4294967296,
-            # "hide_dtype": "9;11",
-            # "ab_testing": "false",
-            "nm": product_id
+            "dest": "-1257786",
+            "nm": product.id,
         }
-
-        try:
-            response_data = await self._make_request(WB_DETAIL_URL, params)
-            if not response_data:
-                return None
-
-            # API v4 возвращает products напрямую (не в data.products)
-            products = response_data.get('products', [])
-            if not products or len(products) == 0:
-                self.logger.warning(f"Товар {product_id} не найден в ответе API")
-                return None
-
-            product = products[0]
-
-            # Извлекаем цену из sizes[0].price.product
-            price = None
-            if product.get('sizes') and len(product['sizes']) > 0:
-                price_data = product['sizes'][0].get('price', {})
-                product_price_kopecks = price_data.get('product')
-                if product_price_kopecks:
-                    price = product_price_kopecks // 100
-
-            return ProductDetails(
-                id=product['id'],
-                name=product.get('name', ''),
-                brand=product.get('brand', ''),
-                price=price,
-                raw_data=product
-            )
-
-        except Exception as e:
-            self.logger.error(f"Ошибка при получении данных о товаре {product_id}: {e}")
-            return None
-
-    async def get_similar_products(self, product_details: ProductDetails) -> SimilarProductsResult:
-        """
-        Получает список похожих товаров
-        Args:
-            product_details: Информация о товаре
-        Returns:
-            SimilarProductsResult: Результат запроса похожих товаров
-        """
-        if not product_details:
+        response = await self._request_with_retry(
+            url=WB_SIMILAR_URL,
+            endpoint="recom_search",
+            request_id=request_id,
+            params=params,
+            context={"article_id": product.id},
+        )
+        if not response.ok:
             return SimilarProductsResult(
-                original_product=ProductDetails(id=0, name="", brand=""),
+                original_product=product,
                 similar_products=[],
-                error="Отсутствуют данные о товаре"
+                error=f"{response.status_class}:{response.error or ''}".rstrip(":"),
             )
 
-        try:
-            product_id = product_details.id
-            product_name = product_details.name
-
-            params = {
-                "q1": f"nm{product_id}key {product_name}",
-                "query": f"похожие {product_id}",
-                "resultset": "catalog",
-                "spp": 30,
-                "curr": "rub",
-                "dest": WB_DEFAULT_DEST
-            }
-            response_data = await self._make_request(WB_SIMILAR_URL, params)
-            if not response_data:
-                return SimilarProductsResult(
-                    original_product=product_details,
-                    similar_products=[],
-                    error="Не удалось получить данные о похожих товарах"
-                )
-            similar_products = []
-            if 'data' in response_data and 'products' in response_data['data']:
-                similar_products = response_data['data']['products']
-                self.logger.info(f"Получено {len(similar_products)} похожих товаров")
-            else:
-                self.logger.warning(f"Похожие товары не найдены для артикула {product_id}")
-
+        payload = response.payload or {}
+        products = payload.get("data", {}).get("products", [])
+        if not isinstance(products, list):
             return SimilarProductsResult(
-                original_product=product_details,
-                similar_products=similar_products
-            )
-        except Exception as e:
-            error_msg = f"Ошибка при получении похожих товаров: {e}"
-            self.logger.error(error_msg)
-            return SimilarProductsResult(
-                original_product=product_details,
+                original_product=product,
                 similar_products=[],
-                error=error_msg
+                error="parse_error",
             )
+        return SimilarProductsResult(
+            original_product=product,
+            similar_products=products,
+            error=None,
+        )
 
     def find_our_article_in_similar(
-            self,
-            similar_result: SimilarProductsResult,
-            our_articles: Set[int]
+        self,
+        similar: SimilarProductsResult,
+        our_articles: Set[int],
     ) -> Tuple[Optional[int], Optional[int]]:
         """
-        Находит наш артикул среди похожих товаров
-        Args:
-            similar_result: Результат запроса похожих товаров
-            our_articles: Множество наших артикулов
-        Returns:
-            Tuple[Optional[int], Optional[int]]: (найденный артикул, позиция)
+        Возвращает найденный артикул из наших и его позицию в выдаче (1-based).
         """
-        if not similar_result or similar_result.error or not similar_result.similar_products or not our_articles:
-            return None, None
-
-        for position, product in enumerate(similar_result.similar_products, 1):
-            product_id = product.get('id')
-            if product_id in our_articles:
-                self.logger.info(f"Найден наш артикул {product_id} на позиции {position}")
-                return product_id, position
-
+        for idx, item in enumerate(similar.similar_products, start=1):
+            try:
+                article_id = int(item.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if article_id in our_articles:
+                return article_id, idx
         return None, None
+
+    def parse_product_details(self, payload: Dict[str, Any]) -> Optional[ProductDetails]:
+        """
+        Нормализует ответ card.json в ProductDetails.
+        """
+        try:
+            product_id = int(payload.get("nm_id") or payload.get("id"))
+        except (TypeError, ValueError):
+            return None
+
+        sizes = payload.get("sizes") or []
+        price: Optional[int] = None
+        if sizes and isinstance(sizes, list):
+            first_size = sizes[0]
+            if isinstance(first_size, dict):
+                price_info = first_size.get("price") or {}
+                if isinstance(price_info, dict):
+                    raw_price = price_info.get("product")
+                    if isinstance(raw_price, int):
+                        price = raw_price // 100
+
+        return ProductDetails(
+            id=product_id,
+            name=str(payload.get("imt_name") or payload.get("name") or ""),
+            brand=str(payload.get("selling", {}).get("brand_name") if isinstance(payload.get("selling"), dict) else payload.get("brand_name") or ""),
+            price=price,
+            raw_data=payload,
+        )
+
+    async def _request_with_retry(
+        self,
+        url: str,
+        endpoint: str,
+        request_id: str,
+        params: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> WBRequestResult:
+        if not self.session:
+            return WBRequestResult(
+                ok=False,
+                status_class="network_error",
+                retriable=True,
+                error="session_not_initialized",
+            )
+
+        if self._is_circuit_open():
+            self.logger.warning(
+                "HTTP-запрос WB пропущен: request_id={} endpoint={} reason=circuit_open",
+                request_id,
+                endpoint,
+            )
+            return WBRequestResult(
+                ok=False,
+                status_class="forbidden",
+                retriable=True,
+                error="circuit_open",
+            )
+
+        retries_used = 0
+        started_total = time.monotonic()
+        self.logger.debug(
+            "Старт HTTP-запроса WB: request_id={} endpoint={} max_retries={} context={}",
+            request_id,
+            endpoint,
+            self.max_retries,
+            context or {},
+        )
+        last_result = WBRequestResult(ok=False, status_class="network_error", retriable=True)
+        for attempt in range(1, self.max_retries + 1):
+            await self._throttle()
+            start = time.monotonic()
+            try:
+                async with self.semaphore:
+                    response = await self.session.get(url, params=params)
+                latency_ms = int((time.monotonic() - start) * 1000)
+                status_code = int(response.status_code)
+                status_class, retriable = self._classify_status(status_code)
+
+                self.logger.info(
+                    "Попытка HTTP-запроса WB: request_id={} endpoint={} status_code={} status_class={} retry_no={} latency_ms={} context={}",
+                    request_id,
+                    endpoint,
+                    status_code,
+                    status_class,
+                    attempt - 1,
+                    latency_ms,
+                    context or {},
+                )
+
+                if status_class == "success":
+                    self.consecutive_forbidden = 0
+                    payload = response.json()
+                    return WBRequestResult(
+                        ok=True,
+                        status_class=status_class,
+                        status_code=status_code,
+                        retriable=False,
+                        payload=payload if isinstance(payload, dict) else {"raw": payload},
+                        latency_ms=latency_ms,
+                        retries_used=retries_used,
+                    )
+
+                last_result = WBRequestResult(
+                    ok=False,
+                    status_class=status_class,
+                    status_code=status_code,
+                    retriable=retriable,
+                    error=f"http_{status_code}",
+                    latency_ms=latency_ms,
+                    retries_used=retries_used,
+                )
+                if status_class == "forbidden":
+                    self.consecutive_forbidden += 1
+                    if self.consecutive_forbidden >= self.forbidden_threshold:
+                        self._open_circuit()
+
+                if not retriable or attempt == self.max_retries:
+                    self.logger.warning(
+                        "HTTP-запрос WB завершился ошибкой: request_id={} endpoint={} final_status_class={} status_code={} retries_used={}",
+                        request_id,
+                        endpoint,
+                        status_class,
+                        status_code,
+                        retries_used,
+                    )
+                    return last_result
+
+                retries_used += 1
+                await self._sleep_before_retry(
+                    attempt=attempt,
+                    status_code=status_code,
+                    retry_after_header=response.headers.get("Retry-After"),
+                )
+            except asyncio.TimeoutError:
+                retries_used += 1
+                latency_ms = int((time.monotonic() - start) * 1000)
+                last_result = WBRequestResult(
+                    ok=False,
+                    status_class="timeout",
+                    retriable=True,
+                    error="timeout",
+                    latency_ms=latency_ms,
+                    retries_used=retries_used,
+                )
+                self.logger.warning(
+                    "Попытка HTTP-запроса WB: request_id={} status_class=timeout endpoint={} retry_no={} latency_ms={} context={}",
+                    request_id,
+                    endpoint,
+                    attempt - 1,
+                    latency_ms,
+                    context or {},
+                )
+                if attempt == self.max_retries:
+                    self.logger.warning(
+                        "HTTP-запрос WB завершился таймаутом: request_id={} endpoint={} retries_used={}",
+                        request_id,
+                        endpoint,
+                        retries_used,
+                    )
+                    return last_result
+                await self._sleep_before_retry(attempt=attempt, status_code=None, retry_after_header=None)
+            except Exception as exc:
+                retries_used += 1
+                latency_ms = int((time.monotonic() - start) * 1000)
+                last_result = WBRequestResult(
+                    ok=False,
+                    status_class="network_error",
+                    retriable=True,
+                    error=str(exc),
+                    latency_ms=latency_ms,
+                    retries_used=retries_used,
+                )
+                self.logger.warning(
+                    "Попытка HTTP-запроса WB: request_id={} endpoint={} status_class=network_error retry_no={} latency_ms={} context={} error={}",
+                    request_id,
+                    endpoint,
+                    attempt - 1,
+                    latency_ms,
+                    context or {},
+                    exc,
+                )
+                if attempt == self.max_retries:
+                    self.logger.warning(
+                        "HTTP-запрос WB завершился сетевой ошибкой: request_id={} endpoint={} retries_used={}",
+                        request_id,
+                        endpoint,
+                        retries_used,
+                    )
+                    return last_result
+                await self._sleep_before_retry(attempt=attempt, status_code=None, retry_after_header=None)
+
+            if time.monotonic() - started_total > self.timeout * self.max_retries * 2:
+                break
+        return last_result
+
+    async def _throttle(self) -> None:
+        """
+        Простой RPS limiter на endpoint без дополнительных зависимостей.
+        """
+        now = time.monotonic()
+        while self._request_timestamps and now - self._request_timestamps[0] > self.rps_window_seconds:
+            self._request_timestamps.popleft()
+        if len(self._request_timestamps) >= self.max_rps:
+            sleep_for = self.rps_window_seconds - (now - self._request_timestamps[0])
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+        self._request_timestamps.append(time.monotonic())
+
+    async def _sleep_before_retry(
+        self,
+        attempt: int,
+        status_code: Optional[int],
+        retry_after_header: Optional[str],
+    ) -> None:
+        if status_code == 429 and retry_after_header:
+            try:
+                delay = float(retry_after_header)
+            except ValueError:
+                delay = self.cooldown_seconds
+        elif status_code == 429:
+            delay = self.cooldown_seconds
+        elif status_code in (403, 498):
+            delay = min(self.cooldown_seconds, self.base_retry_delay * (2 ** attempt))
+        else:
+            delay = self.base_retry_delay * (2 ** (attempt - 1))
+        jitter = random.uniform(0.05, 0.25)
+        self.logger.debug(
+            "Пауза перед retry WB: status_code={} attempt={} base_delay_s={} jitter_s={:.3f}",
+            status_code,
+            attempt,
+            delay,
+            jitter,
+        )
+        await asyncio.sleep(delay + jitter)
+
+    def _is_circuit_open(self) -> bool:
+        return time.monotonic() < self.circuit_open_until
+
+    def _open_circuit(self) -> None:
+        self.circuit_open_until = time.monotonic() + self.cooldown_seconds
+        self.logger.warning("Открыт circuit breaker WB на {} сек из-за повторных forbidden-ответов", self.cooldown_seconds)
+
+    @staticmethod
+    def _classify_status(status_code: int) -> Tuple[str, bool]:
+        if status_code == 200:
+            return "success", False
+        if status_code == 404:
+            return "not_found", False
+        if status_code == 429:
+            return "rate_limited", True
+        if status_code in (403, 498):
+            return "forbidden", True
+        if 500 <= status_code <= 599:
+            return "upstream_5xx", True
+        if 400 <= status_code <= 499:
+            return "client_4xx", False
+        return "unknown_status", True
+
+    @staticmethod
+    def _get_basket_data(product_id: int) -> Dict[str, Any]:
+        vol = product_id // 100000
+        part = product_id // 1000
+        if vol <= 143:
+            basket = "01"
+        elif vol <= 287:
+            basket = "02"
+        elif vol <= 431:
+            basket = "03"
+        elif vol <= 719:
+            basket = "04"
+        elif vol <= 1007:
+            basket = "05"
+        elif vol <= 1061:
+            basket = "06"
+        elif vol <= 1115:
+            basket = "07"
+        elif vol <= 1169:
+            basket = "08"
+        elif vol <= 1313:
+            basket = "09"
+        elif vol <= 1601:
+            basket = "10"
+        elif vol <= 1655:
+            basket = "11"
+        elif vol <= 1919:
+            basket = "12"
+        elif vol <= 2045:
+            basket = "13"
+        elif vol <= 2189:
+            basket = "14"
+        elif vol <= 2405:
+            basket = "15"
+        elif vol <= 2621:
+            basket = "16"
+        elif vol <= 2837:
+            basket = "17"
+        elif vol <= 3053:
+            basket = "18"
+        elif vol <= 3269:
+            basket = "19"
+        elif vol <= 3485:
+            basket = "20"
+        elif vol <= 3809:
+            basket = "21"
+        else:
+            basket = "22"
+        return {"basket": basket, "vol": vol, "part": part}

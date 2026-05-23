@@ -1,7 +1,9 @@
 """
-Модуль для работы с базой данных ClickHouse (полностью синхронный)
+Модуль для работы с ClickHouse (синхронный).
 """
-from typing import List, Dict, Any, Optional
+
+from typing import List
+
 from clickhouse_driver import Client
 from loguru import logger
 
@@ -9,103 +11,75 @@ from src.data_models import ProcessingResult
 
 
 class ClickHouseClient:
-    """Синхронный клиент для работы с ClickHouse"""
+    """Синхронный клиент для работы с ClickHouse."""
 
     def __init__(self, connection_params: dict):
-        """
-        Инициализация клиента ClickHouse
-        
-        Args:
-            connection_params: Параметры подключения к базе данных
-        """
         self.connection_params = connection_params
         self.client = None
         self.logger = logger
 
     def connect(self) -> bool:
-        """
-        Синхронное подключение к базе данных ClickHouse
-        
-        Returns:
-            bool: True в случае успеха, False в случае ошибки
-        """
         try:
-            self.client = Client(
-                host=self.connection_params['host'],
-                port=self.connection_params['port'],
-                user=self.connection_params['user'],
-                password=self.connection_params['password'],
-                database=self.connection_params['database'],
-                settings={
-                    'use_numpy': False,  # Отключаем numpy для лучшей совместимости
-                }
+            self.logger.info(
+                "Подключение к ClickHouse: старт host={} port={} db={}",
+                self.connection_params["host"],
+                self.connection_params["port"],
+                self.connection_params["database"],
             )
-
-            # Проверяем подключение выполнением простого запроса
+            self.client = Client(
+                host=self.connection_params["host"],
+                port=self.connection_params["port"],
+                user=self.connection_params["user"],
+                password=self.connection_params["password"],
+                database=self.connection_params["database"],
+                settings={"use_numpy": False},
+            )
             result = self.client.execute("SELECT 1")
             if result and result[0][0] == 1:
-                self.logger.info(
-                    f"Подключено к ClickHouse: {self.connection_params['host']}:{self.connection_params['port']}"
-                )
+                self.logger.info("Подключение к ClickHouse: успешно")
                 return True
-            else:
-                self.logger.error("Ошибка проверки подключения к ClickHouse")
-                return False
-
-        except Exception as e:
-            self.logger.error(f"Ошибка при подключении к ClickHouse: {e}")
+            self.logger.error("Подключение к ClickHouse: проверка соединения не пройдена")
+            return False
+        except Exception as exc:
+            self.logger.exception("Подключение к ClickHouse: ошибка {}", exc)
             return False
 
     def close(self) -> None:
-        """Закрытие соединения с базой данных ClickHouse"""
         self.client = None
-
+        self.logger.info("Соединение ClickHouse закрыто")
 
     def save_results(self, results: List[ProcessingResult]) -> bool:
-        """
-        Сохраняет результаты обработки в таблицу product_positions
-        
-        Args:
-            results: Список объектов ProcessingResult
-            
-        Returns:
-            bool: True в случае успеха, False в случае ошибки
-        """
         if not self.client:
-            self.logger.error("Нет соединения с базой данных ClickHouse")
+            self.logger.error("Нет соединения с ClickHouse")
             return False
-
         if not results:
+            self.logger.info("Сохранение в ClickHouse пропущено: пустой батч")
             return True
 
         try:
-            # Подготавливаем данные для вставки
-            records = []
-            for result in results:
-                records.append((
+            self.logger.info("Сохранение в ClickHouse: старт count={}", len(results))
+            records = [
+                (
                     result.article_id,
                     result.price,
                     result.found_article,
                     result.position,
                     result.processed_at,
                     result.wild,
-                    result.concurrent
-                ))
-
-            # Выполняем вставку всех данных одним запросом
+                    result.concurrent,
+                )
+                for result in results
+            ]
             self.client.execute(
                 """
-                INSERT INTO product_positions 
-                (article_id, price, found_article, position, processed_at, wild, concurrent) 
+                INSERT INTO product_positions
+                (article_id, price, found_article, position, processed_at, wild, concurrent)
                 VALUES
                 """,
-                records
+                records,
             )
-
-            self.logger.info(f"Сохранено {len(results)} записей в ClickHouse")
+            self.logger.info("Сохранение в ClickHouse: успешно count={}", len(results))
             return True
-
-        except Exception as e:
-            self.logger.error(f"Ошибка при сохранении результатов в ClickHouse: {e}")
+        except Exception as exc:
+            self.logger.exception("Сохранение в ClickHouse: ошибка count={} error={}", len(results), exc)
             return False
-
