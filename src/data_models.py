@@ -64,3 +64,7 @@ class RuntimeMetrics:
     batch_successful_items: int = 0
     batch_failed_items: int = 0
     latencies_ms: List[int] = field(default_factory=list)
+    detail_success_total: int = 0
+    detail_failed_total: int = 0
+    similar_success_total: int = 0
+    similar_failed_total: int = 0

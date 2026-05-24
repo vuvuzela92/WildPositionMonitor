@@ -1,4 +1,4 @@
-"""
+﻿"""
 Основной модуль для мониторинга позиций товаров Wildberries.
 """
 
@@ -190,6 +190,16 @@ class WildPosition:
         }
         target_ids = (self.checkpoint_state.pending | recoverable_failed) - self.checkpoint_state.done
         target_ids -= self.checkpoint_state.failed_terminal
+
+        # Если checkpoint полностью "выжег" список, но входные данные есть,
+        # выполняем полный проход заново (важно для периодического hourly-run).
+        if not target_ids and indexed:
+            logger.warning(
+                "Checkpoint не содержит задач для обработки, выполняем сброс состояния и полный проход по текущему входу"
+            )
+            self.checkpoint_state = CheckpointState(pending=set(indexed.keys()))
+            target_ids = set(indexed.keys())
+
         self.checkpoint_store.save(self.checkpoint_state)
         return [indexed[article_id] for article_id in target_ids if article_id in indexed]
 
@@ -226,7 +236,7 @@ class WildPosition:
         )
         try:
             product_response = await self.wb_service.get_product_details(article_id, request_id=request_id)
-            self._collect_http_metrics(product_response)
+            self._collect_http_metrics(product_response, stage="detail")
             if not product_response.ok:
                 return self._failed_result(
                     article_id=article_id,
@@ -263,6 +273,7 @@ class WildPosition:
                 )
 
             similar = await self.wb_service.get_similar_products(product, request_id=request_id)
+            self._collect_similar_metrics(similar)
             if similar.error:
                 return self._failed_result(
                     article_id=article_id,
@@ -287,6 +298,13 @@ class WildPosition:
                 "Обработка артикула завершена успешно: request_id={} article_id={}",
                 request_id,
                 article_id,
+            )
+            logger.info(
+                "Итог по артикулу: article_id={} price={} status=ok found_article={} position={}",
+                article_id,
+                product.price,
+                found_id,
+                position,
             )
             return ProcessingResult(
                 article_id=article_id,
@@ -326,8 +344,9 @@ class WildPosition:
     ) -> ProcessingResult:
         self.metrics.batch_failed_items += 1
         logger.warning(
-            "Обработка артикула завершилась ошибкой: article_id={} status={} error={}",
+            "Обработка артикула завершилась ошибкой: article_id={} price={} status={} error={}",
             article_id,
+            price,
             status,
             message,
         )
@@ -340,14 +359,18 @@ class WildPosition:
             concurrent=competitor_status,
         )
 
-    def _collect_http_metrics(self, response: Any) -> None:
+    def _collect_http_metrics(self, response: Any, stage: str) -> None:
         self.metrics.total_requests += 1
         self.metrics.retries_total += int(response.retries_used)
         self.metrics.latencies_ms.append(int(response.latency_ms))
         if response.ok:
             self.metrics.successful_requests += 1
+            if stage == "detail":
+                self.metrics.detail_success_total += 1
         else:
             self.metrics.failed_requests += 1
+            if stage == "detail":
+                self.metrics.detail_failed_total += 1
         if response.status_class == "rate_limited":
             self.metrics.rate_limited_total += 1
         if response.status_class == "forbidden":
@@ -356,6 +379,12 @@ class WildPosition:
             self.metrics.timeouts_total += 1
         if response.error == "circuit_open":
             self.metrics.short_circuited_total += 1
+
+    def _collect_similar_metrics(self, similar: Any) -> None:
+        if getattr(similar, "error", None):
+            self.metrics.similar_failed_total += 1
+        else:
+            self.metrics.similar_success_total += 1
 
     def _update_checkpoint_after_batch(self, batch_results: List[ProcessingResult]) -> None:
         for result in batch_results:
@@ -436,6 +465,7 @@ class WildPosition:
         logger.info(
             "Итоговые метрики: wb_requests_total={} wb_success_total={} wb_failed_total={} wb_retries_total={} "
             "wb_rate_limited_total={} wb_forbidden_total={} wb_timeouts_total={} wb_short_circuited_total={} "
+            "detail_success_total={} detail_failed_total={} similar_success_total={} similar_failed_total={} "
             "wb_request_latency_ms_p50={} wb_request_latency_ms_p95={} wb_request_latency_ms_p99={} "
             "batch_success_total={} batch_failed_total={}",
             self.metrics.total_requests,
@@ -446,6 +476,10 @@ class WildPosition:
             self.metrics.forbidden_total,
             self.metrics.timeouts_total,
             self.metrics.short_circuited_total,
+            self.metrics.detail_success_total,
+            self.metrics.detail_failed_total,
+            self.metrics.similar_success_total,
+            self.metrics.similar_failed_total,
             p50,
             p95,
             p99,
@@ -484,3 +518,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

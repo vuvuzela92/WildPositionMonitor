@@ -1,6 +1,4 @@
-"""
-Асинхронный сервис для работы с Wildberries API c базовой отказоустойчивостью.
-"""
+﻿"""Асинхронный сервис для работы с Wildberries API."""
 
 from __future__ import annotations
 
@@ -15,6 +13,8 @@ from loguru import logger
 
 from src.config import (
     CONCURRENT_REQUESTS_LIMIT,
+    WB_DEFAULT_DEST,
+    WB_DETAIL_URL,
     WB_CIRCUIT_COOLDOWN,
     WB_FORBIDDEN_THRESHOLD,
     WB_MAX_RETRIES,
@@ -40,6 +40,8 @@ class WildberriesService:
         self.cooldown_seconds = max(10, int(WB_CIRCUIT_COOLDOWN or WB_RATE_LIMIT_DELAY))
         self.consecutive_forbidden = 0
         self.circuit_open_until = 0.0
+        self.circuit_open_reason = ""
+        self.half_open_probe_in_flight = False
         self.max_rps = max(1, WB_MAX_RPS)
         self.rps_window_seconds = 1.0
         self._request_timestamps: deque[float] = deque()
@@ -51,9 +53,9 @@ class WildberriesService:
         }
 
     async def initialize(self) -> None:
-        """Инициализация сессии."""
+        """Инициализация HTTP-сессии."""
         self.session = AsyncSession(
-            impersonate="chrome124",
+            impersonate="chrome120",
             timeout=self.timeout,
             headers=self.default_headers,
         )
@@ -61,13 +63,11 @@ class WildberriesService:
 
     async def close(self) -> None:
         if self.session:
-            self.session.close()
+            await self.session.close()
             self.logger.info("Сессия сервиса WB закрыта")
 
     async def update_concurrency_limit(self, new_limit: int) -> None:
-        """
-        Мягко изменяет лимит конкурентности, не ломая активные запросы.
-        """
+        """Мягко изменяет лимит конкурентности без остановки активных запросов."""
         if new_limit < 1:
             new_limit = 1
         if new_limit == self.current_concurrency_limit:
@@ -77,16 +77,41 @@ class WildberriesService:
         self.logger.info("Лимит конкурентности WB обновлен: {}", new_limit)
 
     async def get_product_details(self, product_id: int, request_id: str) -> WBRequestResult:
-        """
-        Получает данные товара из WB basket JSON endpoint.
-        """
+        """Получает данные товара: основной endpoint + fallback на basket."""
+        detail_params = {
+            "appType": 1,
+            "curr": "rub",
+            "dest": WB_DEFAULT_DEST,
+            "spp": 30,
+            "hide_vflags": 4294967296,
+            "ab_testing": "false",
+            "lang": "ru",
+            "nm": product_id,
+        }
+        detail_response = await self._request_with_retry(
+            url=WB_DETAIL_URL,
+            endpoint="card_detail_v4",
+            request_id=request_id,
+            params=detail_params,
+            context={"article_id": product_id},
+        )
+        if detail_response.ok:
+            return detail_response
+
         basket_data = self._get_basket_data(product_id)
-        url = (
+        basket_url = (
             f"https://basket-{basket_data['basket']}.wbbasket.ru/"
             f"vol{basket_data['vol']}/part{basket_data['part']}/{product_id}/info/ru/card.json"
         )
+        self.logger.warning(
+            "Переход на fallback basket endpoint: request_id={} article_id={} prev_status={} prev_error={}",
+            request_id,
+            product_id,
+            detail_response.status_class,
+            detail_response.error,
+        )
         return await self._request_with_retry(
-            url=url,
+            url=basket_url,
             endpoint="basket_card",
             request_id=request_id,
             context={"article_id": product_id},
@@ -97,14 +122,14 @@ class WildberriesService:
         product: ProductDetails,
         request_id: str,
     ) -> SimilarProductsResult:
-        """
-        Получает похожие товары через recom endpoint.
-        """
+        """Получает похожие товары через recom endpoint."""
         params = {
-            "appType": 1,
+            "q1": f"nm{product.id}key {product.name}",
+            "query": f"похожие {product.id}",
+            "resultset": "catalog",
+            "spp": 30,
             "curr": "rub",
-            "dest": "-1257786",
-            "nm": product.id,
+            "dest": WB_DEFAULT_DEST,
         }
         response = await self._request_with_retry(
             url=WB_SIMILAR_URL,
@@ -139,9 +164,7 @@ class WildberriesService:
         similar: SimilarProductsResult,
         our_articles: Set[int],
     ) -> Tuple[Optional[int], Optional[int]]:
-        """
-        Возвращает найденный артикул из наших и его позицию в выдаче (1-based).
-        """
+        """Возвращает найденный артикул и позицию в выдаче (1-based)."""
         for idx, item in enumerate(similar.similar_products, start=1):
             try:
                 article_id = int(item.get("id"))
@@ -152,31 +175,46 @@ class WildberriesService:
         return None, None
 
     def parse_product_details(self, payload: Dict[str, Any]) -> Optional[ProductDetails]:
-        """
-        Нормализует ответ card.json в ProductDetails.
-        """
+        """Нормализует ответ карточки в ProductDetails."""
+        product_payload: Dict[str, Any]
+        products = payload.get("products")
+        if isinstance(products, list) and products:
+            first_product = products[0]
+            if not isinstance(first_product, dict):
+                return None
+            product_payload = first_product
+        else:
+            product_payload = payload
+
         try:
-            product_id = int(payload.get("nm_id") or payload.get("id"))
+            product_id = int(product_payload.get("nm_id") or product_payload.get("id"))
         except (TypeError, ValueError):
             return None
 
-        sizes = payload.get("sizes") or []
+        sizes = product_payload.get("sizes") or []
         price: Optional[int] = None
         if sizes and isinstance(sizes, list):
-            first_size = sizes[0]
-            if isinstance(first_size, dict):
-                price_info = first_size.get("price") or {}
-                if isinstance(price_info, dict):
-                    raw_price = price_info.get("product")
-                    if isinstance(raw_price, int):
-                        price = raw_price // 100
+            for size in sizes:
+                if not isinstance(size, dict):
+                    continue
+                price_info = size.get("price") or {}
+                if not isinstance(price_info, dict):
+                    continue
+                raw_price = price_info.get("product")
+                if isinstance(raw_price, (int, float)):
+                    price = int(raw_price) // 100
+                    break
 
         return ProductDetails(
             id=product_id,
-            name=str(payload.get("imt_name") or payload.get("name") or ""),
-            brand=str(payload.get("selling", {}).get("brand_name") if isinstance(payload.get("selling"), dict) else payload.get("brand_name") or ""),
+            name=str(product_payload.get("imt_name") or product_payload.get("name") or ""),
+            brand=str(
+                product_payload.get("selling", {}).get("brand_name")
+                if isinstance(product_payload.get("selling"), dict)
+                else product_payload.get("brand_name") or ""
+            ),
             price=price,
-            raw_data=payload,
+            raw_data=product_payload,
         )
 
     async def _request_with_retry(
@@ -220,6 +258,7 @@ class WildberriesService:
         last_result = WBRequestResult(ok=False, status_class="network_error", retriable=True)
         for attempt in range(1, self.max_retries + 1):
             await self._throttle()
+            await asyncio.sleep(random.uniform(0.01, 0.08))
             start = time.monotonic()
             try:
                 async with self.semaphore:
@@ -241,6 +280,7 @@ class WildberriesService:
 
                 if status_class == "success":
                     self.consecutive_forbidden = 0
+                    self._close_circuit_if_half_open()
                     payload = response.json()
                     return WBRequestResult(
                         ok=True,
@@ -264,7 +304,8 @@ class WildberriesService:
                 if status_class == "forbidden":
                     self.consecutive_forbidden += 1
                     if self.consecutive_forbidden >= self.forbidden_threshold:
-                        self._open_circuit()
+                        self._open_circuit(reason=f"forbidden_threshold:{self.consecutive_forbidden}")
+                    retriable = retriable and attempt < 2
 
                 if not retriable or attempt == self.max_retries:
                     self.logger.warning(
@@ -346,9 +387,7 @@ class WildberriesService:
         return last_result
 
     async def _throttle(self) -> None:
-        """
-        Простой RPS limiter на endpoint без дополнительных зависимостей.
-        """
+        """Простой RPS limiter без внешних зависимостей."""
         now = time.monotonic()
         while self._request_timestamps and now - self._request_timestamps[0] > self.rps_window_seconds:
             self._request_timestamps.popleft()
@@ -386,11 +425,33 @@ class WildberriesService:
         await asyncio.sleep(delay + jitter)
 
     def _is_circuit_open(self) -> bool:
-        return time.monotonic() < self.circuit_open_until
+        now = time.monotonic()
+        if now < self.circuit_open_until:
+            return True
+        if self.circuit_open_until > 0 and not self.half_open_probe_in_flight:
+            self.half_open_probe_in_flight = True
+            self.logger.info("Circuit breaker WB: half-open probe разрешен")
+            return False
+        if self.half_open_probe_in_flight:
+            return True
+        return False
 
-    def _open_circuit(self) -> None:
+    def _open_circuit(self, reason: str) -> None:
         self.circuit_open_until = time.monotonic() + self.cooldown_seconds
-        self.logger.warning("Открыт circuit breaker WB на {} сек из-за повторных forbidden-ответов", self.cooldown_seconds)
+        self.circuit_open_reason = reason
+        self.half_open_probe_in_flight = False
+        self.logger.warning(
+            "Открыт circuit breaker WB: cooldown_s={} reason={}",
+            self.cooldown_seconds,
+            reason,
+        )
+
+    def _close_circuit_if_half_open(self) -> None:
+        if self.half_open_probe_in_flight or self.circuit_open_until > 0:
+            self.circuit_open_until = 0.0
+            self.circuit_open_reason = ""
+            self.half_open_probe_in_flight = False
+            self.logger.info("Circuit breaker WB закрыт после успешной half-open пробы")
 
     @staticmethod
     def _classify_status(status_code: int) -> Tuple[str, bool]:
