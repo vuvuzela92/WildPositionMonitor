@@ -1,5 +1,20 @@
-﻿"""
-Основной модуль для мониторинга позиций товаров Wildberries.
+"""Основной orchestration-модуль мониторинга Wildberries.
+
+Архитектурная роль модуля:
+- управляет жизненным циклом клиентов БД и HTTP-сервиса WB;
+- обрабатывает артикулы батчами и сохраняет результаты;
+- ведёт runtime-метрики и checkpoint для восстановления;
+- адаптирует конкурентность по сигналам rate-limit/forbidden.
+
+WARNING:
+Модуль чувствителен к:
+- timing patterns (ритм запросов),
+- retry behavior,
+- concurrency level,
+- session lifecycle WB-сервиса.
+
+Изменения этих аспектов без анализа production-логов могут привести
+к росту 403/429 и снижению полноты данных.
 """
 
 from __future__ import annotations
@@ -45,6 +60,16 @@ from src.utils.google_sheets_reader import GoogleSheetsReader
 
 @dataclass
 class CheckpointState:
+    """Состояние checkpoint для восстановления после падений.
+
+    Поля:
+    - `pending`: артикулы, ожидающие обработки;
+    - `in_progress`: артикулы, обрабатываемые прямо сейчас;
+    - `done`: успешно обработанные артикулы;
+    - `failed_retriable`: счётчик ретраев для временных ошибок;
+    - `failed_terminal`: артикулы с финальной ошибкой.
+    """
+
     pending: Set[int] = field(default_factory=set)
     in_progress: Set[int] = field(default_factory=set)
     done: Set[int] = field(default_factory=set)
@@ -53,10 +78,23 @@ class CheckpointState:
 
 
 class CheckpointStore:
+    """Файловое хранилище checkpoint в JSON-формате."""
+
     def __init__(self, file_path: str) -> None:
+        """Инициализирует путь хранения checkpoint-файла."""
         self.path = Path(file_path)
 
     def load(self) -> CheckpointState:
+        """Загружает checkpoint из файла.
+
+        Возвращает:
+        - `CheckpointState` из файла;
+        - пустое состояние, если файл отсутствует/повреждён.
+
+        Риск:
+        - повреждённый JSON не должен падать в исключение на уровне запуска,
+          иначе hourly-run может полностью остановиться.
+        """
         if not self.path.exists():
             return CheckpointState()
         try:
@@ -73,6 +111,11 @@ class CheckpointStore:
             return CheckpointState()
 
     def save(self, state: CheckpointState) -> None:
+        """Сохраняет checkpoint в JSON-файл (UTF-8).
+
+        Побочный эффект:
+        - создаёт родительскую директорию при необходимости.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "pending": sorted(state.pending),
@@ -84,6 +127,8 @@ class CheckpointStore:
         self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# Глобальные singleton-зависимости (legacy-паттерн проекта).
+# WARNING: их жизненный цикл завязан на жизненный цикл процесса.
 psql_client = PostgresClient(
     {
         "host": POSTGRES_HOST,
@@ -106,6 +151,19 @@ wb_serv = WildberriesService()
 
 
 class WildPosition:
+    """Оркестратор процесса мониторинга позиций.
+
+    Класс объединяет:
+    - подготовку входных данных,
+    - async-обработку товаров,
+    - сохранение результатов,
+    - адаптивную регулировку конкурентности.
+
+    WARNING (legacy):
+    Реализован как singleton. Не меняйте этот паттерн без анализа всех
+    side-effect в точке входа и тестах, иначе можно получить дубли инициализации.
+    """
+
     __instance = None
 
     def __init__(
@@ -114,6 +172,7 @@ class WildPosition:
         clickhouse_client: ClickHouseClient,
         wb_service: WildberriesService,
     ) -> None:
+        """Инициализирует зависимости оркестратора и runtime-состояние."""
         self.postgres_client = postgres_client
         self.clickhouse_client = clickhouse_client
         self.wb_service = wb_service
@@ -124,6 +183,20 @@ class WildPosition:
         self.checkpoint_state = self.checkpoint_store.load()
 
     async def run(self, articles_data: List[Dict[str, Any]]) -> bool:
+        """Запускает полный цикл мониторинга.
+
+        Параметры:
+        - `articles_data`: входной список словарей с `article_id` и контекстом.
+
+        Возвращает:
+        - `True`, если pipeline выполнен (даже если часть артикулов с ошибками);
+        - `False`, если произошла критическая ошибка инициализации/выполнения.
+
+        Побочные эффекты:
+        - сетевые запросы к WB;
+        - чтение/запись в PostgreSQL/ClickHouse;
+        - запись checkpoint и runtime-логов.
+        """
         logger.info("Запуск мониторинга WB, входных элементов={}", len(articles_data))
         try:
             if not await self.postgres_client.connect():
@@ -150,8 +223,13 @@ class WildPosition:
                 batch_num = i // BATCH_SIZE + 1
                 logger.info("Старт батча {}/{} (размер={})", batch_num, total_batches, len(batch))
 
+                # Async-обработка батча и sync-запись в ClickHouse через thread pool,
+                # чтобы не блокировать event loop.
                 batch_results = await self._process_batch(batch, our_articles, batch_num=batch_num)
                 await to_thread(self.clickhouse_client.save_results, batch_results)
+
+                # Обновляем состояние восстановления и адаптируем конкурентность
+                # только после фиксации результатов текущего батча.
                 self._update_checkpoint_after_batch(batch_results)
                 await self._adapt_concurrency(batch_results)
                 self._log_batch_metrics(batch_num, total_batches, batch_results)
@@ -166,6 +244,7 @@ class WildPosition:
             await self._close_connections()
 
     async def _close_connections(self) -> None:
+        """Закрывает все внешние ресурсы в контролируемом порядке."""
         logger.info("Начато закрытие ресурсов")
         await self.wb_service.close()
         await self.postgres_client.close()
@@ -173,6 +252,18 @@ class WildPosition:
         logger.info("Закрытие ресурсов завершено")
 
     def _prepare_articles_for_run(self, articles_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Подготавливает итоговый список артикулов к запуску.
+
+        Логика:
+        - синхронизирует вход с checkpoint;
+        - добавляет retriable-ошибки в повторную обработку;
+        - исключает terminal-ошибки;
+        - делает reset checkpoint, если состояние полностью "выгорело".
+
+        WARNING:
+        Поведение reset нужно для hourly-run. Удаление этого блока приведёт
+        к ситуации, когда периодический запуск перестанет обрабатывать вход.
+        """
         indexed = {int(item["article_id"]): item for item in articles_data if item.get("article_id")}
         if not self.checkpoint_state.pending:
             self.checkpoint_state.pending = set(indexed.keys())
@@ -209,6 +300,12 @@ class WildPosition:
         our_articles: Set[int],
         batch_num: int,
     ) -> List[ProcessingResult]:
+        """Параллельно обрабатывает один батч артикулов.
+
+        Почему `asyncio.gather`:
+        - сохраняется управляемая конкурентность внутри WB-сервиса через semaphore;
+        - оркестратор остаётся простым и не дублирует ограничение конкуренции.
+        """
         tasks = [
             self._process_single_article(article_info, our_articles, batch_num=batch_num)
             for article_info in articles_data
@@ -222,10 +319,26 @@ class WildPosition:
         our_articles: Set[int],
         batch_num: int,
     ) -> ProcessingResult:
+        """Обрабатывает один артикул: detail -> parse -> similar -> match.
+
+        Параметры:
+        - `article_info`: входной словарь с артикулом и вспомогательными полями;
+        - `our_articles`: множество наших артикулов для быстрого поиска;
+        - `batch_num`: номер батча (используется в request_id и логах).
+
+        Возвращает:
+        - `ProcessingResult` с данными или ошибкой.
+
+        Побочные эффекты:
+        - HTTP-запросы в WB;
+        - изменения checkpoint state (`in_progress`/`pending`).
+        """
         article_id = int(article_info["article_id"])
         request_id = f"{batch_num}-{article_id}-{uuid4().hex[:8]}"
         wild_value = article_info.get("wild", "")
         competitor_status = article_info.get("competitor_status", "")
+
+        # Фиксируем переход артикула в in_progress до начала сетевых вызовов.
         self.checkpoint_state.in_progress.add(article_id)
         self.checkpoint_state.pending.discard(article_id)
         logger.debug(
@@ -331,6 +444,7 @@ class WildPosition:
                 competitor_status=competitor_status,
             )
         finally:
+            # Гарантируем очистку in_progress при любом исходе.
             self.checkpoint_state.in_progress.discard(article_id)
 
     def _failed_result(
@@ -342,6 +456,7 @@ class WildPosition:
         competitor_status: str,
         price: Optional[int] = None,
     ) -> ProcessingResult:
+        """Формирует единый объект ошибки и учитывает метрики batch-неудач."""
         self.metrics.batch_failed_items += 1
         logger.warning(
             "Обработка артикула завершилась ошибкой: article_id={} price={} status={} error={}",
@@ -360,6 +475,7 @@ class WildPosition:
         )
 
     def _collect_http_metrics(self, response: Any, stage: str) -> None:
+        """Агрегирует HTTP-метрики для финального отчёта по запуску."""
         self.metrics.total_requests += 1
         self.metrics.retries_total += int(response.retries_used)
         self.metrics.latencies_ms.append(int(response.latency_ms))
@@ -381,12 +497,22 @@ class WildPosition:
             self.metrics.short_circuited_total += 1
 
     def _collect_similar_metrics(self, similar: Any) -> None:
+        """Агрегирует счётчики успешности этапа similar-поиска."""
         if getattr(similar, "error", None):
             self.metrics.similar_failed_total += 1
         else:
             self.metrics.similar_success_total += 1
 
     def _update_checkpoint_after_batch(self, batch_results: List[ProcessingResult]) -> None:
+        """Обновляет checkpoint по результатам батча.
+
+        Логика делит ошибки на retriable/terminal по текстовому контракту
+        (`rate_limited`, `forbidden`, `timeout`, ...).
+
+        WARNING:
+        Это legacy-совместимый механизм. Изменение error-contract строк без
+        синхронной правки WB-сервиса может сломать восстановление после падений.
+        """
         for result in batch_results:
             article_id = int(result.article_id)
             if not result.error:
@@ -414,6 +540,16 @@ class WildPosition:
         self.checkpoint_store.save(self.checkpoint_state)
 
     async def _adapt_concurrency(self, batch_results: List[ProcessingResult]) -> None:
+        """Адаптивно регулирует конкурентность WB-запросов.
+
+        Идея:
+        - при росте forbidden/rate_limited снижаем параллелизм;
+        - при стабильности постепенно повышаем обратно.
+
+        WARNING:
+        Это антибот-чувствительный механизм. Ускорение step-up или повышение
+        верхнего лимита без анализа может изменить timing profile клиента.
+        """
         if not batch_results:
             return
         window = batch_results[-ADAPTIVE_WINDOW_SIZE:]
@@ -440,6 +576,7 @@ class WildPosition:
             logger.info("Повышен лимит конкурентности: new_limit={} ratio={:.2f}", self.current_concurrency, ratio)
 
     def _log_batch_metrics(self, batch_num: int, total_batches: int, batch_results: List[ProcessingResult]) -> None:
+        """Логирует метрики одного батча."""
         batch_total = len(batch_results)
         batch_success = sum(1 for item in batch_results if not item.error)
         batch_ratio = batch_success / max(1, batch_total)
@@ -453,6 +590,7 @@ class WildPosition:
         )
 
     def _log_final_metrics(self) -> None:
+        """Логирует агрегированные метрики всего запуска."""
         latencies = self.metrics.latencies_ms
         p50 = p95 = p99 = 0
         if latencies:
@@ -488,6 +626,12 @@ class WildPosition:
         )
 
     def __new__(cls, *args: Any, **kwargs: Any) -> "WildPosition":
+        """Singleton-конструктор.
+
+        WARNING:
+        Не удаляйте singleton-логику без аудита точек вызова, иначе можно
+        получить повторную инициализацию клиентов и гонки закрытия ресурсов.
+        """
         if not cls.__instance:
             cls.__instance = super(WildPosition, cls).__new__(cls, *args, **kwargs)
             cls.__instance.__init__(
@@ -499,6 +643,7 @@ class WildPosition:
 
     @staticmethod
     def get_instance() -> "WildPosition":
+        """Возвращает singleton-экземпляр оркестратора."""
         if not WildPosition.__instance:
             WildPosition.__new__(WildPosition)
         return WildPosition.__instance
@@ -508,6 +653,7 @@ wild_position = WildPosition.get_instance()
 
 
 async def main() -> None:
+    """Async-точка входа процесса мониторинга."""
     setup_logger()
     articles_data = GoogleSheetsReader().get_articles_from_sheet(GOOGLE_SHEET_NAME)
     if not articles_data:
@@ -518,4 +664,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

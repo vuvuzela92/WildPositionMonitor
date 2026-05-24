@@ -1,5 +1,8 @@
-"""
-Модуль для работы с ClickHouse (синхронный).
+﻿"""Модуль для работы с ClickHouse (синхронный).
+
+Сохранение в ClickHouse выполняется синхронным драйвером.
+В оркестраторе вызов этого клиента уходит в `asyncio.to_thread`, чтобы не
+блокировать event loop и не ломать async-поведение приложения.
 """
 
 from typing import List
@@ -11,14 +14,16 @@ from src.data_models import ProcessingResult
 
 
 class ClickHouseClient:
-    """Синхронный клиент для работы с ClickHouse."""
+    """Синхронный клиент для записи результатов в ClickHouse."""
 
     def __init__(self, connection_params: dict):
+        """Сохраняет параметры подключения и инициализирует состояние клиента."""
         self.connection_params = connection_params
         self.client = None
         self.logger = logger
 
     def connect(self) -> bool:
+        """Подключается к ClickHouse и выполняет простую health-проверку."""
         try:
             self.logger.info(
                 "Подключение к ClickHouse: старт host={} port={} db={}",
@@ -45,10 +50,24 @@ class ClickHouseClient:
             return False
 
     def close(self) -> None:
+        """Логически закрывает клиент ClickHouse."""
         self.client = None
         self.logger.info("Соединение ClickHouse закрыто")
 
     def save_results(self, results: List[ProcessingResult]) -> bool:
+        """Сохраняет батч результатов в таблицу `product_positions`.
+
+        Параметры:
+        - `results`: список результатов обработки артикулов.
+
+        Возвращает:
+        - `True`, если вставка успешна или батч пуст;
+        - `False`, если запись не выполнена.
+
+        WARNING:
+        Схема `INSERT` должна строго соответствовать фактической схеме таблицы.
+        Любое изменение порядка полей без миграции может привести к тихой порче данных.
+        """
         if not self.client:
             self.logger.error("Нет соединения с ClickHouse")
             return False

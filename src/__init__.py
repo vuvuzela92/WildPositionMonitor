@@ -1,5 +1,3 @@
-"""
-WildPositionMonitor - система мониторинга позиций товаров Wildberries в списках похожих товаров.
-"""
+﻿"""WildPositionMonitor — мониторинг позиций товаров Wildberries."""
 
 __version__ = "0.1.0"

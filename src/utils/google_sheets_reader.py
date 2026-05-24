@@ -1,5 +1,15 @@
-"""
-Модуль для работы с Google Sheets.
+"""Утилиты чтения входных артикулов из Google Sheets.
+
+Модуль выполняет:
+- авторизацию service-account в Google API;
+- открытие рабочего листа;
+- чтение строк в pandas DataFrame;
+- нормализацию и валидацию поля артикула.
+
+WARNING:
+Текущая реализация синхронная (gspread + pandas) и вызывается из async-процесса.
+Менять её на асинхронную нужно отдельным анализом, чтобы не сломать
+существующий lifecycle и retry-поведение.
 """
 
 import os
@@ -19,9 +29,10 @@ from src.config import (
 
 
 class GoogleSheetsReader:
-    """Класс для чтения артикулов из Google Sheets."""
+    """Читает и подготавливает артикулы из Google Sheets."""
 
     def __init__(self):
+        """Инициализирует настройки источника и retry-параметры."""
         self.logger = logger
         self.creds_path = GOOGLE_CREDS_PATH
         self.sheet_name = GOOGLE_SHEET_NAME
@@ -32,6 +43,17 @@ class GoogleSheetsReader:
             self.logger.error("Файл учетных данных Google Sheets не найден: path={}", self.creds_path)
 
     def client_init_json(self) -> Optional[Client]:
+        """Инициализирует gspread client через service account.
+
+        Возвращает:
+        - объект `Client` при успехе;
+        - `None` после исчерпания retry.
+
+        Почему sync-retry:
+        - gspread здесь используется синхронно;
+        - метод вызывается до запуска интенсивной WB-части, поэтому простая
+          блокирующая задержка приемлема в текущей архитектуре.
+        """
         retries = 0
         while retries < self.max_retries:
             try:
@@ -62,6 +84,12 @@ class GoogleSheetsReader:
         return None
 
     def connect_to_sheet(self, sheet_name: str) -> Tuple[Optional[Worksheet], Optional[str]]:
+        """Открывает worksheet по имени таблицы.
+
+        Возвращает:
+        - `(worksheet, None)` при успехе;
+        - `(None, error_message)` при неуспехе.
+        """
         retries = 0
         while retries < self.max_retries:
             try:
@@ -101,6 +129,20 @@ class GoogleSheetsReader:
         return None, "gsheets_open_unknown_failure"
 
     def get_articles_from_sheet(self, sheet_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Читает артикулы и возвращает нормализованный список словарей.
+
+        Источник столбцов:
+        - обязательный: `Артикул конкурента`;
+        - опциональные: `wild`, `Статус конкурента`.
+
+        Возвращает:
+        - список элементов формата:
+          `{\"article_id\": int, \"wild\": str, \"competitor_status\": str}`.
+
+        WARNING:
+        Код опирается на текущий формат Google Sheets. Переименование столбцов
+        без синхронной правки здесь приведёт к пустому входу в мониторинг.
+        """
         sheet_name = sheet_name or self.sheet_name
         self.logger.info("Чтение Google таблицы: старт sheet_name={}", sheet_name)
         try:
@@ -127,6 +169,7 @@ class GoogleSheetsReader:
             if "Статус конкурента" not in df.columns:
                 self.logger.warning("В Google таблице отсутствует опциональный столбец: column=Статус конкурента")
 
+            # Нормализуем артикулы в int64 и отбрасываем нечисловые значения.
             df["Артикул"] = pd.to_numeric(df[source_col], errors="coerce")
             df = df.dropna(subset=["Артикул"])
             df["Артикул"] = df["Артикул"].astype("int64")

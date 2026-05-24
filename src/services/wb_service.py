@@ -1,4 +1,21 @@
-﻿"""Асинхронный сервис для работы с Wildberries API."""
+"""Асинхронный сервис для работы с Wildberries API.
+
+Модуль реализует:
+- получение карточки товара;
+- получение похожих товаров;
+- нормализацию payload;
+- устойчивый HTTP-контур с retry/backoff/throttle/circuit breaker.
+
+WARNING:
+Этот код чувствителен к anti-bot профилю:
+- TLS fingerprint (`impersonate`),
+- timing запросов,
+- конкурентность,
+- retry-поведение и паузы.
+
+Даже небольшие изменения без наблюдения по логам могут увеличить 403/429
+и снизить стабильность парсинга.
+"""
 
 from __future__ import annotations
 
@@ -13,9 +30,9 @@ from loguru import logger
 
 from src.config import (
     CONCURRENT_REQUESTS_LIMIT,
+    WB_CIRCUIT_COOLDOWN,
     WB_DEFAULT_DEST,
     WB_DETAIL_URL,
-    WB_CIRCUIT_COOLDOWN,
     WB_FORBIDDEN_THRESHOLD,
     WB_MAX_RETRIES,
     WB_MAX_RPS,
@@ -28,23 +45,45 @@ from src.data_models import ProductDetails, SimilarProductsResult, WBRequestResu
 
 
 class WildberriesService:
+    """Сервис HTTP-взаимодействия с Wildberries.
+
+    Ключевые обязанности:
+    - управлять lifecycle единой async-сессии;
+    - ограничивать конкурентность и RPS;
+    - классифицировать ошибки и выполнять безопасные retry;
+    - изолировать anti-bot чувствительную логику внутри одного модуля.
+    """
+
     def __init__(self) -> None:
+        """Инициализирует runtime-состояние сервиса без открытия сети."""
         self.session: Optional[AsyncSession] = None
         self.logger = logger
+
+        # Глобальный лимитер конкурентности запросов.
+        # WARNING: увеличение лимита может изменить timing profile и trigger anti-bot.
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
         self.current_concurrency_limit = CONCURRENT_REQUESTS_LIMIT
+
+        # Retry/timeout параметры.
         self.max_retries = max(1, WB_MAX_RETRIES)
         self.base_retry_delay = max(0.2, float(WB_RETRY_DELAY))
         self.timeout = max(1, int(WB_TIMEOUT))
+
+        # Circuit breaker параметры для серии forbidden-ответов.
         self.forbidden_threshold = max(1, WB_FORBIDDEN_THRESHOLD)
         self.cooldown_seconds = max(10, int(WB_CIRCUIT_COOLDOWN or WB_RATE_LIMIT_DELAY))
         self.consecutive_forbidden = 0
         self.circuit_open_until = 0.0
         self.circuit_open_reason = ""
         self.half_open_probe_in_flight = False
+
+        # Локальный RPS limiter (token-window).
         self.max_rps = max(1, WB_MAX_RPS)
         self.rps_window_seconds = 1.0
         self._request_timestamps: deque[float] = deque()
+
+        # Стабильный набор заголовков.
+        # WARNING: это часть поведенческого профиля клиента.
         self.default_headers: Dict[str, str] = {
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -53,7 +92,16 @@ class WildberriesService:
         }
 
     async def initialize(self) -> None:
-        """Инициализация HTTP-сессии."""
+        """Создаёт постоянную AsyncSession.
+
+        Почему `curl_cffi.AsyncSession`:
+        - позволяет контролировать TLS fingerprint через `impersonate`;
+        - в практике этого проекта даёт более устойчивый доступ к WB.
+
+        Почему `impersonate="chrome120"`:
+        - это проверенный baseline для текущего окружения;
+        - смена версии может изменить fingerprint и антибот-реакции.
+        """
         self.session = AsyncSession(
             impersonate="chrome120",
             timeout=self.timeout,
@@ -62,12 +110,24 @@ class WildberriesService:
         self.logger.info("Сервис WB инициализирован, создана постоянная async-сессия")
 
     async def close(self) -> None:
+        """Закрывает AsyncSession.
+
+        Побочный эффект:
+        - прекращаются keep-alive соединения, следующий запуск создаст новую сессию.
+        """
         if self.session:
             await self.session.close()
             self.logger.info("Сессия сервиса WB закрыта")
 
     async def update_concurrency_limit(self, new_limit: int) -> None:
-        """Мягко изменяет лимит конкурентности без остановки активных запросов."""
+        """Мягко обновляет лимит конкурентности.
+
+        Параметры:
+        - `new_limit`: новый предел одновременных запросов.
+
+        Риск:
+        - резкие колебания лимита ухудшают предсказуемость timing profile.
+        """
         if new_limit < 1:
             new_limit = 1
         if new_limit == self.current_concurrency_limit:
@@ -77,7 +137,15 @@ class WildberriesService:
         self.logger.info("Лимит конкурентности WB обновлен: {}", new_limit)
 
     async def get_product_details(self, product_id: int, request_id: str) -> WBRequestResult:
-        """Получает данные товара: основной endpoint + fallback на basket."""
+        """Получает карточку товара.
+
+        Алгоритм:
+        1. Основной detail endpoint;
+        2. fallback на basket-card endpoint при неуспехе.
+
+        Возвращает:
+        - `WBRequestResult` с payload и классификацией статуса.
+        """
         detail_params = {
             "appType": 1,
             "curr": "rub",
@@ -122,7 +190,12 @@ class WildberriesService:
         product: ProductDetails,
         request_id: str,
     ) -> SimilarProductsResult:
-        """Получает похожие товары через recom endpoint."""
+        """Получает похожие товары через recom endpoint.
+
+        Важно:
+        - используется исторически стабильный набор query-параметров;
+        - изменение параметров часто приводит к росту 400-ответов.
+        """
         params = {
             "q1": f"nm{product.id}key {product.name}",
             "query": f"похожие {product.id}",
@@ -164,7 +237,12 @@ class WildberriesService:
         similar: SimilarProductsResult,
         our_articles: Set[int],
     ) -> Tuple[Optional[int], Optional[int]]:
-        """Возвращает найденный артикул и позицию в выдаче (1-based)."""
+        """Ищет первый наш артикул в списке похожих товаров.
+
+        Возвращает:
+        - `(article_id, position)` при успехе;
+        - `(None, None)` если совпадений нет.
+        """
         for idx, item in enumerate(similar.similar_products, start=1):
             try:
                 article_id = int(item.get("id"))
@@ -175,7 +253,12 @@ class WildberriesService:
         return None, None
 
     def parse_product_details(self, payload: Dict[str, Any]) -> Optional[ProductDetails]:
-        """Нормализует ответ карточки в ProductDetails."""
+        """Нормализует payload карточки в `ProductDetails`.
+
+        Поддерживает два формата:
+        - `{"products": [...]}` для detail endpoint;
+        - плоский `card.json` объект для basket fallback.
+        """
         product_payload: Dict[str, Any]
         products = payload.get("products")
         if isinstance(products, list) and products:
@@ -202,6 +285,7 @@ class WildberriesService:
                     continue
                 raw_price = price_info.get("product")
                 if isinstance(raw_price, (int, float)):
+                    # WB часто отдаёт цену в \"копейках * 100\" формате.
                     price = int(raw_price) // 100
                     break
 
@@ -225,6 +309,12 @@ class WildberriesService:
         params: Optional[Dict[str, Any]] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> WBRequestResult:
+        """Выполняет HTTP-запрос с retry/backoff/throttle/circuit-breaker.
+
+        Это ключевая anti-bot чувствительная функция.
+        Любые изменения в порядке вызовов, паузах или лимитах должны проверяться
+        на реальных логах с метриками forbidden/rate_limited.
+        """
         if not self.session:
             return WBRequestResult(
                 ok=False,
@@ -257,10 +347,12 @@ class WildberriesService:
         )
         last_result = WBRequestResult(ok=False, status_class="network_error", retriable=True)
         for attempt in range(1, self.max_retries + 1):
+            # RPS-тормоз и небольшой jitter снижают burst-паттерн.
             await self._throttle()
             await asyncio.sleep(random.uniform(0.01, 0.08))
             start = time.monotonic()
             try:
+                # semaphore удерживает верхнюю границу конкурентности.
                 async with self.semaphore:
                     response = await self.session.get(url, params=params)
                 latency_ms = int((time.monotonic() - start) * 1000)
@@ -305,6 +397,7 @@ class WildberriesService:
                     self.consecutive_forbidden += 1
                     if self.consecutive_forbidden >= self.forbidden_threshold:
                         self._open_circuit(reason=f"forbidden_threshold:{self.consecutive_forbidden}")
+                    # Для forbidden делаем максимально ограниченный retry.
                     retriable = retriable and attempt < 2
 
                 if not retriable or attempt == self.max_retries:
@@ -382,12 +475,18 @@ class WildberriesService:
                     return last_result
                 await self._sleep_before_retry(attempt=attempt, status_code=None, retry_after_header=None)
 
+            # Guardrail: не даём одному запросу занимать слишком много общего времени.
             if time.monotonic() - started_total > self.timeout * self.max_retries * 2:
                 break
         return last_result
 
     async def _throttle(self) -> None:
-        """Простой RPS limiter без внешних зависимостей."""
+        """Ограничивает RPS в скользящем окне.
+
+        Почему локально в сервисе:
+        - не нужен внешний rate-limiter;
+        - поведение полностью детерминировано в рамках процесса.
+        """
         now = time.monotonic()
         while self._request_timestamps and now - self._request_timestamps[0] > self.rps_window_seconds:
             self._request_timestamps.popleft()
@@ -403,6 +502,13 @@ class WildberriesService:
         status_code: Optional[int],
         retry_after_header: Optional[str],
     ) -> None:
+        """Вычисляет паузу перед retry с backoff и jitter.
+
+        Политика:
+        - 429: уважать `Retry-After`, иначе cooldown;
+        - 403/498: ограниченный backoff;
+        - остальное: экспоненциальный backoff от базовой задержки.
+        """
         if status_code == 429 and retry_after_header:
             try:
                 delay = float(retry_after_header)
@@ -425,6 +531,12 @@ class WildberriesService:
         await asyncio.sleep(delay + jitter)
 
     def _is_circuit_open(self) -> bool:
+        """Проверяет состояние circuit breaker.
+
+        Half-open логика:
+        - после cooldown разрешается одна probe-попытка;
+        - остальные запросы в этот момент остаются закрытыми.
+        """
         now = time.monotonic()
         if now < self.circuit_open_until:
             return True
@@ -437,6 +549,7 @@ class WildberriesService:
         return False
 
     def _open_circuit(self, reason: str) -> None:
+        """Открывает circuit breaker на cooldown-период."""
         self.circuit_open_until = time.monotonic() + self.cooldown_seconds
         self.circuit_open_reason = reason
         self.half_open_probe_in_flight = False
@@ -447,6 +560,7 @@ class WildberriesService:
         )
 
     def _close_circuit_if_half_open(self) -> None:
+        """Закрывает breaker после успешной half-open пробы."""
         if self.half_open_probe_in_flight or self.circuit_open_until > 0:
             self.circuit_open_until = 0.0
             self.circuit_open_reason = ""
@@ -455,6 +569,7 @@ class WildberriesService:
 
     @staticmethod
     def _classify_status(status_code: int) -> Tuple[str, bool]:
+        """Классифицирует HTTP-статус и признак retriable."""
         if status_code == 200:
             return "success", False
         if status_code == 404:
@@ -471,6 +586,11 @@ class WildberriesService:
 
     @staticmethod
     def _get_basket_data(product_id: int) -> Dict[str, Any]:
+        """Вычисляет basket/vol/part для fallback card.json URL.
+
+        Это технический legacy-алгоритм маршрутизации WB-хранилищ.
+        Менять его без проверки на реальных артикулах не рекомендуется.
+        """
         vol = product_id // 100000
         part = product_id // 1000
         if vol <= 143:
