@@ -12,10 +12,13 @@ from loguru import logger
 from src.config import (
     POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
     CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DB,
-    BATCH_SIZE, DATA_SOURCE, GOOGLE_SHEET_NAME
+    BATCH_SIZE, DATA_SOURCE, GOOGLE_SHEET_NAME,
+    LOG_DIR, LOG_CLEANUP_ENABLED, LOG_CLEANUP_INTERVAL_HOURS,
+    LOG_RETENTION_DAYS, LOG_CLEANUP_STATE_FILE
 )
 from src.db.postgres_client import PostgresClient
 from src.db.clickhouse_client import ClickHouseClient
+from src.log_cleanup import cleanup_old_log_files
 from src.services.wb_service import WildberriesService
 from src.data_models import ProcessingResult
 from src.utils.excel_reader import ExcelReader
@@ -74,6 +77,20 @@ class WildPosition:
         logger.info("Запуск мониторинга товаров Wildberries")
         
         try:
+            # Очистка служебных .log/.csv запускается один раз на старт процесса.
+            # Она не должна выполняться внутри цикла по артикулам, иначе логирование
+            # и запись CSV ошибок будут конкурировать с удалением файлов.
+            try:
+                cleanup_old_log_files(
+                    log_dir=LOG_DIR,
+                    retention_days=LOG_RETENTION_DAYS,
+                    cleanup_state_file=LOG_CLEANUP_STATE_FILE,
+                    cleanup_interval_hours=LOG_CLEANUP_INTERVAL_HOURS,
+                    enabled=LOG_CLEANUP_ENABLED,
+                )
+            except Exception as cleanup_error:
+                logger.warning(f"Не удалось выполнить очистку логов: {cleanup_error}")
+
             # Асинхронное подключение к PostgreSQL
             if not await self.postgres_client.connect():
                 logger.error("Ошибка подключения к PostgreSQL")
@@ -87,6 +104,16 @@ class WildPosition:
             
             # Асинхронная инициализация Wildberries API
             await self.wb_service.initialize()
+            source_name = (
+                f"google_sheets:{GOOGLE_SHEET_NAME}"
+                if DATA_SOURCE == "google_sheets"
+                else DATA_SOURCE
+            )
+            self.wb_service.start_price_parsing(
+                total_count=len(articles_data),
+                mode="monitoring",
+                source=source_name,
+            )
             
             # Получаем список наших артикулов (асинхронно)
             our_articles = await self.postgres_client.get_our_articles()
@@ -117,6 +144,7 @@ class WildPosition:
             return False
         finally:
             # Закрываем соединения
+            self.wb_service.finish_price_parsing()
             await self._close_connections()
     
     async def _close_connections(self) -> None:

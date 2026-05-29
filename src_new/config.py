@@ -1,0 +1,78 @@
+# Время ожидания между запусками парсера (3600 секунд = 1 час)
+UPDATE_INTERVAL = 3600 
+
+# Ссылка для получения информации о цене
+WB_PRICE_URL = "https://www.wildberries.ru/__internal/card/cards/v4/detail"
+# Куки
+WB_RAW_COOKIES = (
+    "external-locale=ru; _wbauid=2477851001764666101; "
+    "x-supplier-id-external=11ab4eb4-7970-46fa-bee0-d2f552620e8a; "
+    "cfidsw-wb=pKF0dyplztYFHsrWM52CB0N5POPzetZFp/och+l+rkWy/y3oCRCbsdHV7vusHD9eFP8UGr/K8k97bawlCxiwqnsyCm0g7WTdywRJ8DSsBCVMeukjfwjf9R02557auDiZtRpBrnUwp6Ws/9imc4hClvAE8SlEagmF90aQon0=; "
+    "__zzatw-wb=MDA0dC0yYBwREFsKEH49WgsbSl1pCENQGC9LXz1uLWEPJ3wjYnwgGWsvC1RDMmUIPkBNOTM5NGZwVydgTmAkS1ZVfycdEndtH0FLVCNyM3dlaXceViUTFmcPRyJ1F0hAGxI6aCU6f1JpGWUzDldjGAsmVDVfP3wnHxZ3byxScX9NfXY3PmJ+MQ9pOSRjCh9+OFoLDWk3XBQ8dWU+SHR4MTxtI2FLWh9EUT9FbllGaXUVF0M8HHsNKkNtLToZUXYQQlh4cBpEN0AYfxVZUnUpbn06MBtFVx0YTF4jQw8JfyciQ3skKVQ4EmNudnN1Lz8eURp7FiJER0lrZU5TQixmG3EVTQgNND1aciIPWzklWAgSPwsmIBh8cyRXDQ1fPkFubxt/Nl0cOWMRCxl+OmNdRkc3FSR7dSYKCTU3YnAvTCB7SykWRxsyYV5GaXUVAg8FUF2J3cmQm4kX0RdJXkOSjNaThF0JyUNDBBdQ0NtMDFsVxlRDxZhDhYYRRcje0I3Yhk4QhgvPV8/YngiD2lIYCZIXU4JKxsVeXEpS3FPLH12X30beylOIA0lVBMhP05yxKmKfQ==; "
+    "x_wbaas_token=1.1000.cecb542ad0c148a8b9fb4e89f978a0d2.MTV8MTUwLjI0MS43Ni40NXxNb3ppbGxhLzUuMCAoV2luZG93cyBOVCAxMC4wOyBXaW42NDsgeDY0KSBBcHBsZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBDaHJvbWUvMTQ3LjAuMC4wIFNhZmFyaS81MzcuMzZ8MTc3OTQzNTk3NHxyZXVzYWJsZXwyfGV5Sm9ZWE5vSWpvaUluMD18MHwzfDE3NzkzMDYzNzR8MQ==.MEUCIQD51iDwxL0Hm3RESPKuXl+3q14WD1+OPrj58f969iV+igIgfcxgqoSLj4XhkizsV1ZWvg7zX6D9NSa8hEvJCS4IavY="
+)
+
+# Ограничение на общее количество обрабатываемых артикулов за один запуск для тестов, для прода ставим None
+MAX_ARTICLES_TO_PROCESS = 100
+# Актуальный список артикулов для проверки
+PRODUCT_LIST = [
+    189954586,
+    489570061,
+    489570482,
+    489570201,
+    489570288,
+    209667566,
+    189579546,
+    209666680,
+    209664375,
+    489569911,
+    489570587,
+    489569910,
+    189956071,
+    489570390,
+    209667880,
+    171386618,
+    189956512,
+    189955657,
+    489570060,
+    189956346,
+    154791822,
+    148565424,
+    489570481,
+    147675447,
+    160163535,
+    272584722,
+    417425678,
+    489570200,
+    489570586,
+    189955217,
+    153272519,
+    471231778,
+    467180717,
+    417425261,
+    489570287,
+    471230169,
+    161217712,
+    161217369,
+    154790374,
+    471238078,
+    467175081,
+    234906388,
+    189954913,
+    153272594,
+    272629524,
+    544870425,
+    235754763,
+    235759561,
+    348509358,
+    348514902,
+    235765421,
+    272626990,
+    417428035,
+    175012432,
+    165567400,
+    189917678,
+    168103192,
+    365759091,
+    160165106,
+]

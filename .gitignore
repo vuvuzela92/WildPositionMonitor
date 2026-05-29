@@ -20,11 +20,18 @@ __pycache__/
 *.log
 logs/
 log/
+logs/*.log
+logs/*.csv
+logs/.last_cleanup
 
 # Секретные данные
 .env
 creds.json
 uv.lock
+data/wb_cookies.txt
+secrets/wb_cookies.txt
+secrets/
+*.cookies
 
 # Данные
 input/
