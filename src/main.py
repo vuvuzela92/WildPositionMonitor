@@ -32,13 +32,6 @@ from uuid import uuid4
 from loguru import logger
 
 from src.config import (
-<<<<<<< HEAD
-    POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
-    CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DB,
-    BATCH_SIZE, DATA_SOURCE, GOOGLE_SHEET_NAME,
-    LOG_DIR, LOG_CLEANUP_ENABLED, LOG_CLEANUP_INTERVAL_HOURS,
-    LOG_RETENTION_DAYS, LOG_CLEANUP_STATE_FILE
-=======
     ADAPTIVE_WINDOW_SIZE,
     BATCH_SIZE,
     CHECKPOINT_FILE_PATH,
@@ -56,16 +49,11 @@ from src.config import (
     POSTGRES_PASSWORD,
     POSTGRES_PORT,
     POSTGRES_USER,
->>>>>>> 39e1d09fbb95eba434b392739d843118dfd5a507
 )
 from src.data_models import ProcessingResult, RuntimeMetrics
 from src.db.clickhouse_client import ClickHouseClient
-<<<<<<< HEAD
-from src.log_cleanup import cleanup_old_log_files
-=======
 from src.db.postgres_client import PostgresClient
 from src.logger import setup_logger
->>>>>>> 39e1d09fbb95eba434b392739d843118dfd5a507
 from src.services.wb_service import WildberriesService
 from src.utils.google_sheets_reader import GoogleSheetsReader
 
@@ -188,51 +176,11 @@ class WildPosition:
         self.postgres_client = postgres_client
         self.clickhouse_client = clickhouse_client
         self.wb_service = wb_service
-<<<<<<< HEAD
-    
-    async def run(self, articles_data: List[Dict[str, Any]]) -> bool | None:
-        """
-        Запускает процесс мониторинга для списка артикулов
-        
-        Args:
-            articles_data: Список словарей с информацией об артикулах
-            
-        Returns:
-            bool: True в случае успеха, False в случае ошибки
-        """
-        logger.info("Запуск мониторинга товаров Wildberries")
-        
-        try:
-            # Очистка служебных .log/.csv запускается один раз на старт процесса.
-            # Она не должна выполняться внутри цикла по артикулам, иначе логирование
-            # и запись CSV ошибок будут конкурировать с удалением файлов.
-            try:
-                cleanup_old_log_files(
-                    log_dir=LOG_DIR,
-                    retention_days=LOG_RETENTION_DAYS,
-                    cleanup_state_file=LOG_CLEANUP_STATE_FILE,
-                    cleanup_interval_hours=LOG_CLEANUP_INTERVAL_HOURS,
-                    enabled=LOG_CLEANUP_ENABLED,
-                )
-            except Exception as cleanup_error:
-                logger.warning(f"Не удалось выполнить очистку логов: {cleanup_error}")
-
-            # Асинхронное подключение к PostgreSQL
-            if not await self.postgres_client.connect():
-                logger.error("Ошибка подключения к PostgreSQL")
-                return False
-                
-            # Синхронное подключение к ClickHouse
-            if not self.clickhouse_client.connect():
-                logger.error("Ошибка подключения к ClickHouse")
-                return False
-=======
         self.metrics = RuntimeMetrics()
         self.current_concurrency = CONCURRENT_REQUESTS_LIMIT
         self.max_retry_per_item = 2
         self.checkpoint_store = CheckpointStore(CHECKPOINT_FILE_PATH)
         self.checkpoint_state = self.checkpoint_store.load()
->>>>>>> 39e1d09fbb95eba434b392739d843118dfd5a507
 
     async def run(self, articles_data: List[Dict[str, Any]]) -> bool:
         """Запускает полный цикл мониторинга.
@@ -258,27 +206,12 @@ class WildPosition:
                 logger.error("Не удалось подключиться к ClickHouse")
                 return False
             await self.wb_service.initialize()
-<<<<<<< HEAD
-            source_name = (
-                f"google_sheets:{GOOGLE_SHEET_NAME}"
-                if DATA_SOURCE == "google_sheets"
-                else DATA_SOURCE
-            )
-            self.wb_service.start_price_parsing(
-                total_count=len(articles_data),
-                mode="monitoring",
-                source=source_name,
-            )
-            
-            # Получаем список наших артикулов (асинхронно)
-=======
 
             filtered_articles = self._prepare_articles_for_run(articles_data)
             if not filtered_articles:
                 logger.warning("Нет артикулов для обработки после фильтра checkpoint")
                 return True
 
->>>>>>> 39e1d09fbb95eba434b392739d843118dfd5a507
             our_articles = await self.postgres_client.get_our_articles()
             if not our_articles:
                 logger.error("Не удалось получить список наших артикулов")
@@ -308,11 +241,6 @@ class WildPosition:
             logger.exception("Мониторинг WB завершился с ошибкой: {}", exc)
             return False
         finally:
-<<<<<<< HEAD
-            # Закрываем соединения
-            self.wb_service.finish_price_parsing()
-=======
->>>>>>> 39e1d09fbb95eba434b392739d843118dfd5a507
             await self._close_connections()
 
     async def _close_connections(self) -> None:
