@@ -54,6 +54,8 @@ class ProcessingResult:
     """
 
     article_id: int
+    task_key: str = ""
+    status: str = "ok"
     price: Optional[int] = None
     found_article: Optional[int] = None
     position: Optional[int] = None

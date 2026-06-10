@@ -23,7 +23,7 @@ import asyncio
 import random
 import time
 from collections import deque
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import Timeout
@@ -301,6 +301,54 @@ class WildberriesService:
             price=price,
             raw_data=product_payload,
         )
+
+    def build_price_diagnostics(self, product: ProductDetails) -> Dict[str, Any]:
+        """Возвращает компактную диагностику структуры карточки для кейсов без цены."""
+        raw_data = product.raw_data if isinstance(product.raw_data, dict) else {}
+        sizes = raw_data.get("sizes")
+        size_items: List[Dict[str, Any]] = sizes if isinstance(sizes, list) else []
+        candidate_fields = (
+            "product",
+            "basic",
+            "total",
+            "logistics",
+            "sale",
+            "price",
+            "finalPrice",
+            "salePrice",
+            "walletPrice",
+            "clientPrice",
+        )
+
+        size_samples = []
+        for size in size_items[:2]:
+            if not isinstance(size, dict):
+                size_samples.append({"size_type": type(size).__name__})
+                continue
+
+            nested_price = size.get("price")
+            nested_price_dict = nested_price if isinstance(nested_price, dict) else {}
+            candidate_values: Dict[str, Any] = {}
+            for field_name in candidate_fields:
+                if field_name in size and not isinstance(size[field_name], (dict, list)):
+                    candidate_values[f"size.{field_name}"] = size[field_name]
+                if field_name in nested_price_dict and not isinstance(nested_price_dict[field_name], (dict, list)):
+                    candidate_values[f"size.price.{field_name}"] = nested_price_dict[field_name]
+
+            size_samples.append(
+                {
+                    "size_keys": sorted(size.keys()),
+                    "price_keys": sorted(nested_price_dict.keys()) if nested_price_dict else [],
+                    "candidate_values": candidate_values,
+                }
+            )
+
+        return {
+            "product_id": product.id,
+            "top_level_keys": sorted(raw_data.keys()),
+            "sizes_count": len(size_items),
+            "size_samples": size_samples,
+        }
 
     async def _request_with_retry(
         self,

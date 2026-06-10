@@ -70,11 +70,11 @@ class CheckpointState:
     - `failed_terminal`: артикулы с финальной ошибкой.
     """
 
-    pending: Set[int] = field(default_factory=set)
-    in_progress: Set[int] = field(default_factory=set)
-    done: Set[int] = field(default_factory=set)
-    failed_retriable: Dict[int, int] = field(default_factory=dict)
-    failed_terminal: Set[int] = field(default_factory=set)
+    pending: Set[str] = field(default_factory=set)
+    in_progress: Set[str] = field(default_factory=set)
+    done: Set[str] = field(default_factory=set)
+    failed_retriable: Dict[str, int] = field(default_factory=dict)
+    failed_terminal: Set[str] = field(default_factory=set)
 
 
 class CheckpointStore:
@@ -100,11 +100,11 @@ class CheckpointStore:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             return CheckpointState(
-                pending={int(x) for x in payload.get("pending", [])},
-                in_progress={int(x) for x in payload.get("in_progress", [])},
-                done={int(x) for x in payload.get("done", [])},
-                failed_retriable={int(k): int(v) for k, v in payload.get("failed_retriable", {}).items()},
-                failed_terminal={int(x) for x in payload.get("failed_terminal", [])},
+                pending={str(x) for x in payload.get("pending", [])},
+                in_progress={str(x) for x in payload.get("in_progress", [])},
+                done={str(x) for x in payload.get("done", [])},
+                failed_retriable={str(k): int(v) for k, v in payload.get("failed_retriable", {}).items()},
+                failed_terminal={str(x) for x in payload.get("failed_terminal", [])},
             )
         except Exception as exc:
             logger.error("Ошибка загрузки checkpoint: path={} error={}", self.path, exc)
@@ -125,6 +125,14 @@ class CheckpointStore:
             "failed_terminal": sorted(state.failed_terminal),
         }
         self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_task_key(article_info: Dict[str, Any]) -> str:
+    """Строит составной ключ задачи, чтобы не терять строки с одинаковым article_id."""
+    article_id = int(article_info["article_id"])
+    wild = str(article_info.get("wild", "") or "").strip()
+    competitor_status = str(article_info.get("competitor_status", "") or "").strip()
+    return f"{wild}|{article_id}|{competitor_status}"
 
 
 # Глобальные singleton-зависимости (legacy-паттерн проекта).
@@ -179,6 +187,8 @@ class WildPosition:
         self.metrics = RuntimeMetrics()
         self.current_concurrency = CONCURRENT_REQUESTS_LIMIT
         self.max_retry_per_item = 2
+        self.price_diagnostics_limit = 10
+        self.price_diagnostics_logged = 0
         self.checkpoint_store = CheckpointStore(CHECKPOINT_FILE_PATH)
         self.checkpoint_state = self.checkpoint_store.load()
 
@@ -264,19 +274,32 @@ class WildPosition:
         Поведение reset нужно для hourly-run. Удаление этого блока приведёт
         к ситуации, когда периодический запуск перестанет обрабатывать вход.
         """
-        indexed = {int(item["article_id"]): item for item in articles_data if item.get("article_id")}
+        indexed: Dict[str, Dict[str, Any]] = {}
+        for item in articles_data:
+            if not item.get("article_id"):
+                continue
+            task_item = dict(item)
+            task_item["task_key"] = build_task_key(task_item)
+            indexed[task_item["task_key"]] = task_item
+
+        if self._has_legacy_checkpoint_keys():
+            logger.warning(
+                "Обнаружен legacy checkpoint с ключами только по article_id, выполняем безопасный сброс состояния для перехода на составные task_key"
+            )
+            self.checkpoint_state = CheckpointState()
+
         if not self.checkpoint_state.pending:
             self.checkpoint_state.pending = set(indexed.keys())
         else:
             self.checkpoint_state.pending = {
-                article_id
-                for article_id in self.checkpoint_state.pending
-                if article_id in indexed
+                task_key
+                for task_key in self.checkpoint_state.pending
+                if task_key in indexed
             }
 
         recoverable_failed = {
-            article_id
-            for article_id, retries in self.checkpoint_state.failed_retriable.items()
+            task_key
+            for task_key, retries in self.checkpoint_state.failed_retriable.items()
             if retries <= self.max_retry_per_item
         }
         target_ids = (self.checkpoint_state.pending | recoverable_failed) - self.checkpoint_state.done
@@ -293,6 +316,17 @@ class WildPosition:
 
         self.checkpoint_store.save(self.checkpoint_state)
         return [indexed[article_id] for article_id in target_ids if article_id in indexed]
+
+    def _has_legacy_checkpoint_keys(self) -> bool:
+        """Определяет, что checkpoint ещё использует старые ключи по одному article_id."""
+        key_groups = (
+            self.checkpoint_state.pending,
+            self.checkpoint_state.in_progress,
+            self.checkpoint_state.done,
+            self.checkpoint_state.failed_terminal,
+            set(self.checkpoint_state.failed_retriable.keys()),
+        )
+        return any("|" not in key for group in key_groups for key in group)
 
     async def _process_batch(
         self,
@@ -334,16 +368,18 @@ class WildPosition:
         - изменения checkpoint state (`in_progress`/`pending`).
         """
         article_id = int(article_info["article_id"])
+        task_key = str(article_info.get("task_key") or build_task_key(article_info))
         request_id = f"{batch_num}-{article_id}-{uuid4().hex[:8]}"
         wild_value = article_info.get("wild", "")
         competitor_status = article_info.get("competitor_status", "")
 
         # Фиксируем переход артикула в in_progress до начала сетевых вызовов.
-        self.checkpoint_state.in_progress.add(article_id)
-        self.checkpoint_state.pending.discard(article_id)
+        self.checkpoint_state.in_progress.add(task_key)
+        self.checkpoint_state.pending.discard(task_key)
         logger.debug(
-            "Старт обработки артикула: request_id={} article_id={} batch_num={}",
+            "Старт обработки артикула: request_id={} task_key={} article_id={} batch_num={}",
             request_id,
+            task_key,
             article_id,
             batch_num,
         )
@@ -353,6 +389,7 @@ class WildPosition:
             if not product_response.ok:
                 return self._failed_result(
                     article_id=article_id,
+                    task_key=task_key,
                     status=product_response.status_class,
                     message=product_response.error or "ошибка_получения_товара",
                     wild=wild_value,
@@ -364,19 +401,13 @@ class WildPosition:
             if not product:
                 return self._failed_result(
                     article_id=article_id,
+                    task_key=task_key,
                     status="parse_error",
                     message="некорректный_ответ_товара",
                     wild=wild_value,
                     competitor_status=competitor_status,
                 )
-            if product.price is None:
-                logger.warning(
-                    "Цена не распарсена: request_id={} article_id={} product_id={} price=None",
-                    request_id,
-                    article_id,
-                    product.id,
-                )
-            else:
+            if product.price is not None:
                 logger.info(
                     "Цена распарсена: request_id={} article_id={} product_id={} price={}",
                     request_id,
@@ -390,6 +421,7 @@ class WildPosition:
             if similar.error:
                 return self._failed_result(
                     article_id=article_id,
+                    task_key=task_key,
                     status="similar_fetch_error",
                     message=similar.error,
                     wild=wild_value,
@@ -406,21 +438,58 @@ class WildPosition:
                     found_id,
                     position,
                 )
+            if product.price is None:
+                self.metrics.batch_failed_items += 1
+                self._log_price_not_found(
+                    request_id=request_id,
+                    article_id=article_id,
+                    task_key=task_key,
+                    product=product,
+                    wild=wild_value,
+                    competitor_status=competitor_status,
+                )
+                logger.info(
+                    "Итог по артикулу: task_key={} article_id={} price=None status=price_not_found found_article={} position={} wild={} competitor_status={}",
+                    task_key,
+                    article_id,
+                    found_id,
+                    position,
+                    wild_value,
+                    competitor_status,
+                )
+                return ProcessingResult(
+                    article_id=article_id,
+                    task_key=task_key,
+                    status="price_not_found",
+                    price=None,
+                    found_article=found_id,
+                    position=position,
+                    processed_at=datetime.now(),
+                    error="price_not_found:цена_не_извлечена",
+                    wild=wild_value,
+                    concurrent=competitor_status,
+                )
             self.metrics.batch_successful_items += 1
             logger.debug(
-                "Обработка артикула завершена успешно: request_id={} article_id={}",
+                "Обработка артикула завершена успешно: request_id={} task_key={} article_id={}",
                 request_id,
+                task_key,
                 article_id,
             )
             logger.info(
-                "Итог по артикулу: article_id={} price={} status=ok found_article={} position={}",
+                "Итог по артикулу: task_key={} article_id={} price={} status=ok found_article={} position={} wild={} competitor_status={}",
+                task_key,
                 article_id,
                 product.price,
                 found_id,
                 position,
+                wild_value,
+                competitor_status,
             )
             return ProcessingResult(
                 article_id=article_id,
+                task_key=task_key,
+                status="ok",
                 price=product.price,
                 found_article=found_id,
                 position=position,
@@ -438,6 +507,7 @@ class WildPosition:
             )
             return self._failed_result(
                 article_id=article_id,
+                task_key=task_key,
                 status="ошибка_обработки",
                 message=str(exc),
                 wild=wild_value,
@@ -445,11 +515,12 @@ class WildPosition:
             )
         finally:
             # Гарантируем очистку in_progress при любом исходе.
-            self.checkpoint_state.in_progress.discard(article_id)
+            self.checkpoint_state.in_progress.discard(task_key)
 
     def _failed_result(
         self,
         article_id: int,
+        task_key: str,
         status: str,
         message: str,
         wild: str,
@@ -459,19 +530,56 @@ class WildPosition:
         """Формирует единый объект ошибки и учитывает метрики batch-неудач."""
         self.metrics.batch_failed_items += 1
         logger.warning(
-            "Обработка артикула завершилась ошибкой: article_id={} price={} status={} error={}",
+            "Обработка артикула завершилась ошибкой: task_key={} article_id={} price={} status={} wild={} competitor_status={} error={}",
+            task_key,
             article_id,
             price,
             status,
+            wild,
+            competitor_status,
             message,
         )
         return ProcessingResult(
             article_id=article_id,
+            task_key=task_key,
+            status=status,
             price=price,
             error=f"{status}:{message}",
             processed_at=datetime.now(),
             wild=wild,
             concurrent=competitor_status,
+        )
+
+    def _log_price_not_found(
+        self,
+        request_id: str,
+        article_id: int,
+        task_key: str,
+        product: Any,
+        wild: str,
+        competitor_status: str,
+    ) -> None:
+        """Логирует отдельный сигнал для карточек без извлечённой цены."""
+        logger.warning(
+            "Цена не извлечена: request_id={} task_key={} article_id={} product_id={} wild={} competitor_status={} reason=price_not_found",
+            request_id,
+            task_key,
+            article_id,
+            product.id,
+            wild,
+            competitor_status,
+        )
+        if self.price_diagnostics_logged >= self.price_diagnostics_limit:
+            return
+
+        self.price_diagnostics_logged += 1
+        diagnostics = self.wb_service.build_price_diagnostics(product)
+        logger.warning(
+            "Диагностика price_not_found: request_id={} task_key={} article_id={} diagnostics={}",
+            request_id,
+            task_key,
+            article_id,
+            diagnostics,
         )
 
     def _collect_http_metrics(self, response: Any, stage: str) -> None:
@@ -514,11 +622,11 @@ class WildPosition:
         синхронной правки WB-сервиса может сломать восстановление после падений.
         """
         for result in batch_results:
-            article_id = int(result.article_id)
+            task_key = str(result.task_key or result.article_id)
             if not result.error:
-                self.checkpoint_state.done.add(article_id)
-                self.checkpoint_state.failed_retriable.pop(article_id, None)
-                self.checkpoint_state.failed_terminal.discard(article_id)
+                self.checkpoint_state.done.add(task_key)
+                self.checkpoint_state.failed_retriable.pop(task_key, None)
+                self.checkpoint_state.failed_terminal.discard(task_key)
                 continue
 
             is_retriable = any(
@@ -526,16 +634,16 @@ class WildPosition:
                 for key in ("rate_limited", "forbidden", "upstream_5xx", "timeout", "network_error", "circuit_open")
             )
             if is_retriable:
-                retries = self.checkpoint_state.failed_retriable.get(article_id, 0) + 1
-                self.checkpoint_state.failed_retriable[article_id] = retries
+                retries = self.checkpoint_state.failed_retriable.get(task_key, 0) + 1
+                self.checkpoint_state.failed_retriable[task_key] = retries
                 if retries > self.max_retry_per_item:
-                    self.checkpoint_state.failed_terminal.add(article_id)
-                    self.checkpoint_state.failed_retriable.pop(article_id, None)
+                    self.checkpoint_state.failed_terminal.add(task_key)
+                    self.checkpoint_state.failed_retriable.pop(task_key, None)
                 else:
-                    self.checkpoint_state.pending.add(article_id)
+                    self.checkpoint_state.pending.add(task_key)
             else:
-                self.checkpoint_state.failed_terminal.add(article_id)
-                self.checkpoint_state.failed_retriable.pop(article_id, None)
+                self.checkpoint_state.failed_terminal.add(task_key)
+                self.checkpoint_state.failed_retriable.pop(task_key, None)
 
         self.checkpoint_store.save(self.checkpoint_state)
 
@@ -578,7 +686,7 @@ class WildPosition:
     def _log_batch_metrics(self, batch_num: int, total_batches: int, batch_results: List[ProcessingResult]) -> None:
         """Логирует метрики одного батча."""
         batch_total = len(batch_results)
-        batch_success = sum(1 for item in batch_results if not item.error)
+        batch_success = sum(1 for item in batch_results if item.status == "ok")
         batch_ratio = batch_success / max(1, batch_total)
         logger.info(
             "Батч завершен: batch_num={} total_batches={} batch_total={} batch_success_ratio={:.3f} wb_concurrency_current={}",
