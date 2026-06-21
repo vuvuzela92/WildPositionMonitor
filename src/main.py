@@ -49,6 +49,7 @@ from src.config import (
     POSTGRES_PASSWORD,
     POSTGRES_PORT,
     POSTGRES_USER,
+    WB_ROLLOUT_ARTICLES_LIMIT,
 )
 from src.data_models import ProcessingResult, RuntimeMetrics
 from src.db.clickhouse_client import ClickHouseClient
@@ -75,6 +76,20 @@ class CheckpointState:
     done: Set[str] = field(default_factory=set)
     failed_retriable: Dict[str, int] = field(default_factory=dict)
     failed_terminal: Set[str] = field(default_factory=set)
+
+
+@dataclass
+class RunDiagnosticsState:
+    """Снимок runtime-состояния для диагностики досрочного завершения."""
+
+    current_stage: str = "init"
+    current_batch_index: int = 0
+    total_batches: int = 0
+    current_batch_size: int = 0
+    save_results_started: bool = False
+    save_results_finished: bool = False
+    checkpoint_updated: bool = False
+    batch_metrics_logged: bool = False
 
 
 class CheckpointStore:
@@ -191,6 +206,7 @@ class WildPosition:
         self.price_diagnostics_logged = 0
         self.checkpoint_store = CheckpointStore(CHECKPOINT_FILE_PATH)
         self.checkpoint_state = self.checkpoint_store.load()
+        self.run_diagnostics = RunDiagnosticsState()
 
     async def run(self, articles_data: List[Dict[str, Any]]) -> bool:
         """Запускает полный цикл мониторинга.
@@ -207,51 +223,166 @@ class WildPosition:
         - чтение/запись в PostgreSQL/ClickHouse;
         - запись checkpoint и runtime-логов.
         """
+        self._reset_run_diagnostics()
+        self._set_run_stage("connect_postgres")
         logger.info("Запуск мониторинга WB, входных элементов={}", len(articles_data))
         try:
             if not await self.postgres_client.connect():
                 logger.error("Не удалось подключиться к PostgreSQL")
                 return False
+            self._set_run_stage("connect_clickhouse")
             if not self.clickhouse_client.connect():
                 logger.error("Не удалось подключиться к ClickHouse")
                 return False
+            self._set_run_stage("initialize_wb_service")
             await self.wb_service.initialize()
 
+            self._set_run_stage("prepare_articles")
             filtered_articles = self._prepare_articles_for_run(articles_data)
+            prepared_articles = len(filtered_articles)
+            if WB_ROLLOUT_ARTICLES_LIMIT > 0:
+                logger.info(
+                    "Rollout limit: configured_limit={} prepared_articles={}",
+                    WB_ROLLOUT_ARTICLES_LIMIT,
+                    prepared_articles,
+                )
+                limited_articles = min(prepared_articles, WB_ROLLOUT_ARTICLES_LIMIT)
+                filtered_articles = filtered_articles[:WB_ROLLOUT_ARTICLES_LIMIT]
+                logger.info(
+                    "Rollout limit applied: prepared_articles={} limited_articles={} excluded_by_rollout_limit={}",
+                    prepared_articles,
+                    limited_articles,
+                    prepared_articles - limited_articles,
+                )
+            else:
+                logger.info("Rollout limit disabled: prepared_articles={}", prepared_articles)
             if not filtered_articles:
                 logger.warning("Нет артикулов для обработки после фильтра checkpoint")
                 return True
 
+            self._set_run_stage("load_our_articles")
             our_articles = await self.postgres_client.get_our_articles()
             if not our_articles:
                 logger.error("Не удалось получить список наших артикулов")
                 return False
 
+            self._set_run_stage("build_batches")
             total_batches = (len(filtered_articles) + BATCH_SIZE - 1) // BATCH_SIZE
+            self.run_diagnostics.total_batches = total_batches
             for i in range(0, len(filtered_articles), BATCH_SIZE):
                 batch = filtered_articles[i : i + BATCH_SIZE]
                 batch_num = i // BATCH_SIZE + 1
+                self._start_batch_diagnostics(
+                    batch_num=batch_num,
+                    total_batches=total_batches,
+                    batch_size=len(batch),
+                )
                 logger.info("Старт батча {}/{} (размер={})", batch_num, total_batches, len(batch))
 
                 # Async-обработка батча и sync-запись в ClickHouse через thread pool,
                 # чтобы не блокировать event loop.
+                self._set_run_stage("process_batch")
                 batch_results = await self._process_batch(batch, our_articles, batch_num=batch_num)
-                await to_thread(self.clickhouse_client.save_results, batch_results)
+                self._set_run_stage("save_results")
+                self.run_diagnostics.save_results_started = True
+                self.run_diagnostics.save_results_finished = False
+                logger.info(
+                    "Сохранение батча: старт batch_num={} total_batches={} results_count={}",
+                    batch_num,
+                    total_batches,
+                    len(batch_results),
+                )
+                try:
+                    await to_thread(self.clickhouse_client.save_results, batch_results)
+                except asyncio.CancelledError:
+                    logger.exception(
+                        "Сохранение батча: отменено во время ожидания snapshot={}",
+                        self._diagnostics_snapshot(),
+                    )
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Сохранение батча: ошибка snapshot={}",
+                        self._diagnostics_snapshot(),
+                    )
+                    raise
+                else:
+                    self.run_diagnostics.save_results_finished = True
+                    logger.info(
+                        "Сохранение батча: успешно batch_num={} total_batches={} results_count={}",
+                        batch_num,
+                        total_batches,
+                        len(batch_results),
+                    )
 
                 # Обновляем состояние восстановления и адаптируем конкурентность
                 # только после фиксации результатов текущего батча.
+                self._set_run_stage("update_checkpoint")
                 self._update_checkpoint_after_batch(batch_results)
+                self.run_diagnostics.checkpoint_updated = True
+                self._set_run_stage("adapt_concurrency")
                 await self._adapt_concurrency(batch_results)
+                self._set_run_stage("log_batch_metrics")
                 self._log_batch_metrics(batch_num, total_batches, batch_results)
+                self.run_diagnostics.batch_metrics_logged = True
 
+            self._set_run_stage("final_metrics")
             self._log_final_metrics()
             logger.info("Мониторинг WB завершен успешно, всего обработано={}", len(filtered_articles))
             return True
+        except asyncio.CancelledError:
+            logger.exception(
+                "Мониторинг WB отменён извне: asyncio.CancelledError snapshot={}",
+                self._diagnostics_snapshot(),
+            )
+            raise
         except Exception as exc:
-            logger.exception("Мониторинг WB завершился с ошибкой: {}", exc)
+            logger.exception(
+                "Мониторинг WB завершился с ошибкой: {} snapshot={}",
+                exc,
+                self._diagnostics_snapshot(),
+            )
             return False
+        except BaseException:
+            logger.exception(
+                "Мониторинг WB завершился через BaseException snapshot={}",
+                self._diagnostics_snapshot(),
+            )
+            raise
         finally:
+            self._set_run_stage("close_connections")
             await self._close_connections()
+
+    def _reset_run_diagnostics(self) -> None:
+        """Сбрасывает диагностическое состояние перед новым запуском."""
+        self.run_diagnostics = RunDiagnosticsState()
+
+    def _set_run_stage(self, stage: str) -> None:
+        """Обновляет текущую стадию выполнения для аварийной диагностики."""
+        self.run_diagnostics.current_stage = stage
+
+    def _start_batch_diagnostics(self, batch_num: int, total_batches: int, batch_size: int) -> None:
+        """Подготавливает диагностическое состояние к обработке нового батча."""
+        self.run_diagnostics.current_batch_index = batch_num
+        self.run_diagnostics.total_batches = total_batches
+        self.run_diagnostics.current_batch_size = batch_size
+        self.run_diagnostics.save_results_started = False
+        self.run_diagnostics.save_results_finished = False
+        self.run_diagnostics.checkpoint_updated = False
+        self.run_diagnostics.batch_metrics_logged = False
+
+    def _diagnostics_snapshot(self) -> Dict[str, Any]:
+        """Возвращает снимок состояния выполнения для логирования."""
+        return {
+            "current_stage": self.run_diagnostics.current_stage,
+            "current_batch_index": self.run_diagnostics.current_batch_index,
+            "total_batches": self.run_diagnostics.total_batches,
+            "current_batch_size": self.run_diagnostics.current_batch_size,
+            "save_results_started": self.run_diagnostics.save_results_started,
+            "save_results_finished": self.run_diagnostics.save_results_finished,
+            "checkpoint_updated": self.run_diagnostics.checkpoint_updated,
+            "batch_metrics_logged": self.run_diagnostics.batch_metrics_logged,
+        }
 
     async def _close_connections(self) -> None:
         """Закрывает все внешние ресурсы в контролируемом порядке."""
@@ -771,4 +902,20 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    exit_code = 0
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        exit_code = 130
+        logger.exception("Процесс остановлен вручную: KeyboardInterrupt exit_code={}", exit_code)
+        raise
+    except asyncio.CancelledError:
+        exit_code = 1
+        logger.exception("Главная coroutine отменена: asyncio.CancelledError exit_code={}", exit_code)
+        raise
+    except BaseException:
+        exit_code = 1
+        logger.exception("Процесс завершился через BaseException exit_code={}", exit_code)
+        raise
+    finally:
+        logger.info("Завершение entrypoint: exit_code={}", exit_code)

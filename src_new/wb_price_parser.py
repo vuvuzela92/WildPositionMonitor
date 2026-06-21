@@ -150,7 +150,7 @@ async def main():
     print(f"📦 Всего к обработке: {total_products} артикулов. Размер батча: {batch_size}")
 
     # Создаем одну общую сессию для всех запросов (это экономит ресурсы компьютера)
-    async with AsyncSession(impersonate="chrome110") as session:
+    async with AsyncSession(impersonate="chrome120") as session:
         
         # Делим список на батчи и перебираем их по очереди
         # enumerate(..., 1) нужен, чтобы красиво выводить номера батчей (Батч 1, Батч 2 и т.д.)

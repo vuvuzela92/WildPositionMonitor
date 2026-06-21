@@ -39,6 +39,9 @@ from src.config import (
     WB_MAX_RPS,
     WB_RATE_LIMIT_DELAY,
     WB_RETRY_DELAY,
+    WB_SESSION_ROTATE_EVERY,
+    WB_SESSION_ROTATION_ENABLED,
+    WB_SESSION_ROTATION_SCOPE,
     WB_SIMILAR_URL,
     WB_TIMEOUT,
 )
@@ -59,6 +62,28 @@ class WildberriesService:
         """Инициализирует runtime-состояние сервиса без открытия сети."""
         self.session: Optional[AsyncSession] = None
         self.logger = logger
+
+        # Session rotation конфигурация и runtime-состояние.
+        # На этом шаге поля только подготавливаются и не участвуют в логике запросов.
+        self._session_rotation_enabled = WB_SESSION_ROTATION_ENABLED
+        self._session_rotate_every = WB_SESSION_ROTATE_EVERY
+        self._session_rotation_scope = WB_SESSION_ROTATION_SCOPE
+
+        self._session_generation = 0
+        self._session_request_count = 0
+
+        self._session_lock = asyncio.Lock()
+
+        self._session_inflight_by_generation: Dict[int, int] = {}
+        self._retired_sessions: Dict[int, AsyncSession] = {}
+
+        self._session_rotations_total = 0
+        self._session_rotation_errors_total = 0
+        self._session_creation_failures_total = 0
+        self._session_retired_max = 0
+
+        self._first_403_after_rotation_generation: Optional[int] = None
+        self._last_rotation_started_at: Optional[float] = None
 
         # Глобальный лимитер конкурентности запросов.
         # WARNING: увеличение лимита может изменить timing profile и trigger anti-bot.
@@ -92,6 +117,175 @@ class WildberriesService:
             "Referer": "https://www.wildberries.ru/",
         }
 
+    async def _create_session(self) -> AsyncSession:
+        """Создаёт новую AsyncSession для будущей ротации."""
+        generation = self._session_generation + 1
+        try:
+            session = AsyncSession(
+                impersonate="chrome120",
+                timeout=self.timeout,
+                headers=self.default_headers,
+            )
+        except Exception as exc:
+            self._session_creation_failures_total += 1
+            self.logger.exception("WB session creation failed generation={} error={}", generation, exc)
+            raise
+
+        self.logger.info("WB session created generation={}", generation)
+        return session
+
+    def _should_rotate_session(self) -> bool:
+        """Возвращает `True`, если условия для ротации session уже выполнены."""
+        return (
+            self._session_rotation_enabled is True
+            and self._session_rotation_scope == "detail"
+            and self._session_rotate_every > 0
+            and self._session_request_count >= self._session_rotate_every
+            and self.session is not None
+        )
+
+    async def _rotate_session_if_needed(self) -> None:
+        """Выполняет ротацию active session при достижении порога."""
+        if not self._should_rotate_session():
+            return
+
+        old_session = self.session
+        old_generation = self._session_generation
+        self._last_rotation_started_at = time.monotonic()
+        self.logger.info(
+            "WB session rotation requested generation={} request_count={} rotate_every={}",
+            old_generation,
+            self._session_request_count,
+            self._session_rotate_every,
+        )
+
+        try:
+            new_session = await self._create_session()
+        except Exception:
+            self._session_rotation_errors_total += 1
+            raise
+
+        if old_session is not None:
+            self._retired_sessions[old_generation] = old_session
+
+        new_generation = old_generation + 1
+        self.session = new_session
+        self._session_generation = new_generation
+        self._session_request_count = 0
+        self._session_inflight_by_generation.setdefault(new_generation, 0)
+        self._session_rotations_total += 1
+        self._session_retired_max = max(self._session_retired_max, len(self._retired_sessions))
+        self.logger.info(
+            "WB session rotated old_generation={} new_generation={} retired_count={}",
+            old_generation,
+            new_generation,
+            len(self._retired_sessions),
+        )
+
+    async def _acquire_session_lease(
+        self,
+        *,
+        count_for_rotation: bool,
+    ) -> Tuple[AsyncSession, int]:
+        """Выдаёт active session и generation, резервируя in-flight lease."""
+        async with self._session_lock:
+            if self.session is None:
+                raise RuntimeError("WB session lease requested before session initialization")
+
+            if count_for_rotation:
+                self._session_request_count += 1
+                await self._rotate_session_if_needed()
+
+            session = self.session
+            if session is None:
+                raise RuntimeError("WB session is unavailable after rotation check")
+
+            generation = self._session_generation
+            self._session_inflight_by_generation[generation] = (
+                self._session_inflight_by_generation.get(generation, 0) + 1
+            )
+            return session, generation
+
+    async def _release_session_lease(self, generation: int) -> None:
+        """Освобождает lease и при необходимости закрывает retired session."""
+        session_to_close: Optional[AsyncSession] = None
+
+        async with self._session_lock:
+            current_inflight = self._session_inflight_by_generation.get(generation)
+            if current_inflight is None:
+                self.logger.warning(
+                    "WB session lease release requested for unknown generation={}",
+                    generation,
+                )
+                return
+
+            new_inflight = current_inflight - 1
+            if new_inflight < 0:
+                self.logger.warning(
+                    "WB session inflight became negative generation={} inflight_before={}",
+                    generation,
+                    current_inflight,
+                )
+                new_inflight = 0
+
+            self._session_inflight_by_generation[generation] = new_inflight
+
+            if generation in self._retired_sessions and new_inflight > 0:
+                self.logger.info(
+                    "WB session close deferred generation={} inflight={}",
+                    generation,
+                    new_inflight,
+                )
+
+            if generation in self._retired_sessions and new_inflight == 0:
+                session_to_close = self._retired_sessions.pop(generation)
+                self._session_inflight_by_generation.pop(generation, None)
+
+        if session_to_close is not None:
+            await session_to_close.close()
+            self.logger.info("WB session closed generation={}", generation)
+
+    def _current_retired_inflight(self) -> int:
+        """Возвращает суммарное число in-flight запросов по retired generations."""
+        return sum(
+            self._session_inflight_by_generation.get(generation, 0)
+            for generation in self._retired_sessions
+        )
+
+    def get_session_rotation_metrics(self) -> Dict[str, Any]:
+        """Возвращает безопасные диагностические метрики session rotation."""
+        return {
+            "session_rotation_enabled": self._session_rotation_enabled,
+            "session_generation": self._session_generation,
+            "session_request_count": self._session_request_count,
+            "session_rotations_total": self._session_rotations_total,
+            "session_rotation_errors_total": self._session_rotation_errors_total,
+            "session_creation_failures_total": self._session_creation_failures_total,
+            "session_retired_total": len(self._retired_sessions),
+            "session_retired_inflight_current": self._current_retired_inflight(),
+            "session_retired_max": self._session_retired_max,
+            "first_403_after_rotation_generation": self._first_403_after_rotation_generation,
+        }
+
+    async def _close_active_and_retired_sessions(self) -> None:
+        """Закрывает active session и все retired sessions."""
+        async with self._session_lock:
+            active_session = self.session
+            active_generation = self._session_generation
+            retired_sessions = list(self._retired_sessions.items())
+
+            self.session = None
+            self._retired_sessions = {}
+            self._session_inflight_by_generation = {}
+
+        if active_session is not None:
+            await active_session.close()
+            self.logger.info("WB session closed generation={}", active_generation)
+
+        for generation, session in retired_sessions:
+            await session.close()
+            self.logger.info("WB session closed generation={}", generation)
+
     async def initialize(self) -> None:
         """Создаёт постоянную AsyncSession.
 
@@ -103,11 +297,11 @@ class WildberriesService:
         - это проверенный baseline для текущего окружения;
         - смена версии может изменить fingerprint и антибот-реакции.
         """
-        self.session = AsyncSession(
-            impersonate="chrome120",
-            timeout=self.timeout,
-            headers=self.default_headers,
-        )
+        self.session = await self._create_session()
+        self._session_generation = 1
+        self._session_request_count = 0
+        self._session_inflight_by_generation = {1: 0}
+        self._retired_sessions = {}
         self.logger.info("Сервис WB инициализирован, создана постоянная async-сессия")
 
     async def close(self) -> None:
@@ -116,8 +310,8 @@ class WildberriesService:
         Побочный эффект:
         - прекращаются keep-alive соединения, следующий запуск создаст новую сессию.
         """
-        if self.session:
-            await self.session.close()
+        if self.session or self._retired_sessions:
+            await self._close_active_and_retired_sessions()
             self.logger.info("Сессия сервиса WB закрыта")
 
     async def update_concurrency_limit(self, new_limit: int) -> None:
@@ -157,13 +351,21 @@ class WildberriesService:
             "lang": "ru",
             "nm": product_id,
         }
-        detail_response = await self._request_with_retry(
-            url=WB_DETAIL_URL,
-            endpoint="card_detail_v4",
-            request_id=request_id,
-            params=detail_params,
-            context={"article_id": product_id},
+        detail_session, detail_generation = await self._acquire_session_lease(
+            count_for_rotation=True,
         )
+        try:
+            detail_response = await self._request_with_retry(
+                url=WB_DETAIL_URL,
+                endpoint="card_detail_v4",
+                request_id=request_id,
+                params=detail_params,
+                context={"article_id": product_id},
+                session=detail_session,
+                session_generation=detail_generation,
+            )
+        finally:
+            await self._release_session_lease(detail_generation)
         if detail_response.ok:
             return detail_response
 
@@ -179,12 +381,20 @@ class WildberriesService:
             detail_response.status_class,
             detail_response.error,
         )
-        return await self._request_with_retry(
-            url=basket_url,
-            endpoint="basket_card",
-            request_id=request_id,
-            context={"article_id": product_id},
+        fallback_session, fallback_generation = await self._acquire_session_lease(
+            count_for_rotation=False,
         )
+        try:
+            return await self._request_with_retry(
+                url=basket_url,
+                endpoint="basket_card",
+                request_id=request_id,
+                context={"article_id": product_id},
+                session=fallback_session,
+                session_generation=fallback_generation,
+            )
+        finally:
+            await self._release_session_lease(fallback_generation)
 
     async def get_similar_products(
         self,
@@ -205,13 +415,21 @@ class WildberriesService:
             "curr": "rub",
             "dest": WB_DEFAULT_DEST,
         }
-        response = await self._request_with_retry(
-            url=WB_SIMILAR_URL,
-            endpoint="recom_search",
-            request_id=request_id,
-            params=params,
-            context={"article_id": product.id},
+        session, generation = await self._acquire_session_lease(
+            count_for_rotation=False,
         )
+        try:
+            response = await self._request_with_retry(
+                url=WB_SIMILAR_URL,
+                endpoint="recom_search",
+                request_id=request_id,
+                params=params,
+                context={"article_id": product.id},
+                session=session,
+                session_generation=generation,
+            )
+        finally:
+            await self._release_session_lease(generation)
         if not response.ok:
             return SimilarProductsResult(
                 original_product=product,
@@ -357,6 +575,9 @@ class WildberriesService:
         request_id: str,
         params: Optional[Dict[str, Any]] = None,
         context: Optional[Dict[str, Any]] = None,
+        *,
+        session: AsyncSession,
+        session_generation: int,
     ) -> WBRequestResult:
         """Выполняет HTTP-запрос с retry/backoff/throttle/circuit-breaker.
 
@@ -364,7 +585,7 @@ class WildberriesService:
         Любые изменения в порядке вызовов, паузах или лимитах должны проверяться
         на реальных логах с метриками forbidden/rate_limited.
         """
-        if not self.session:
+        if session is None:
             return WBRequestResult(
                 ok=False,
                 status_class="network_error",
@@ -403,7 +624,7 @@ class WildberriesService:
             try:
                 # semaphore удерживает верхнюю границу конкурентности.
                 async with self.semaphore:
-                    response = await self.session.get(url, params=params)
+                    response = await session.get(url, params=params)
                 latency_ms = int((time.monotonic() - start) * 1000)
                 status_code = int(response.status_code)
                 status_class, retriable = self._classify_status(status_code)
@@ -444,6 +665,15 @@ class WildberriesService:
                 )
                 if status_class == "forbidden":
                     self.consecutive_forbidden += 1
+                    if (
+                        self._session_generation > 1
+                        and self._first_403_after_rotation_generation is None
+                    ):
+                        self._first_403_after_rotation_generation = session_generation
+                        self.logger.warning(
+                            "First 403 after session rotation generation={}",
+                            session_generation,
+                        )
                     if self.consecutive_forbidden >= self.forbidden_threshold:
                         self._open_circuit(reason=f"forbidden_threshold:{self.consecutive_forbidden}")
                     # Для forbidden делаем максимально ограниченный retry.

@@ -81,6 +81,15 @@ WB_MAX_RPS = int(os.getenv("WB_MAX_RPS", "4"))
 WB_FORBIDDEN_THRESHOLD = int(os.getenv("WB_FORBIDDEN_THRESHOLD", "8"))
 WB_CIRCUIT_COOLDOWN = int(os.getenv("WB_CIRCUIT_COOLDOWN", "20"))
 
+# Параметры session rotation. По умолчанию feature выключен и не влияет
+# на production-поведение до отдельного rollout.
+WB_SESSION_ROTATION_ENABLED = os.getenv("WB_SESSION_ROTATION_ENABLED", "False").lower() == "true"
+WB_SESSION_ROTATE_EVERY = int(os.getenv("WB_SESSION_ROTATE_EVERY", "50"))
+WB_SESSION_ROTATION_SCOPE = os.getenv("WB_SESSION_ROTATION_SCOPE", "detail")
+WB_SAFE_CONCURRENCY_LIMIT = int(os.getenv("WB_SAFE_CONCURRENCY_LIMIT", "2"))
+WB_SAFE_REQUEST_DELAY = float(os.getenv("WB_SAFE_REQUEST_DELAY", "0.25"))
+WB_ROLLOUT_ARTICLES_LIMIT = int(os.getenv("WB_ROLLOUT_ARTICLES_LIMIT", "0"))
+
 # Батчинг и конкурентность.
 # WARNING: повышение значений без A/B-проверки может изменить timing profile
 # и привести к росту 403/429 даже при неизменной бизнес-логике.

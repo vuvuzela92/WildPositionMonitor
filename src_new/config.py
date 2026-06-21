@@ -2,7 +2,7 @@
 UPDATE_INTERVAL = 3600 
 
 # Ссылка для получения информации о цене
-WB_PRICE_URL = "https://www.wildberries.ru/__internal/card/cards/v4/detail"
+WB_PRICE_URL = "https://card.wb.ru/cards/v2/detail"
 # Куки
 WB_RAW_COOKIES = (
     "external-locale=ru; _wbauid=2477851001764666101; "
