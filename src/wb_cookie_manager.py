@@ -1,10 +1,12 @@
 """
-Runtime-менеджер cookies Wildberries.
+Runtime cookie manager for Wildberries.
 
-config.py остаётся статической конфигурацией и не используется как хранилище
-runtime-состояния. При HTTP 498 менеджер получает новый x_wbaas_token через
-WbTokenProvider и заменяет только этот cookie в текущей raw cookie string.
+The manager keeps WB cookies only in process memory. It can refresh either the
+full cookie bundle or only x_wbaas_token through WbTokenProvider, without
+writing secrets back to config files.
 """
+
+from __future__ import annotations
 
 from typing import Optional
 
@@ -14,7 +16,7 @@ from src.wb_token_provider import WbTokenProvider
 
 
 class WbCookieManager:
-    """Хранит текущие WB cookies в памяти процесса и обновляет x_wbaas_token."""
+    """Keep current WB cookies in memory and refresh runtime session cookies."""
 
     def __init__(
         self,
@@ -30,25 +32,45 @@ class WbCookieManager:
         self.last_refresh_changed = False
 
     def get_cookies(self) -> str:
-        """Возвращает raw cookie string в формате, который уже ожидает парсер."""
+        """Return raw cookie string in the format already expected by the parser."""
         return self._cookies
+
+    def refresh_full_cookies(self) -> bool:
+        """Refresh the full cookie bundle in process memory."""
+        if not self.auto_refresh_enabled:
+            logger.warning("WB full-cookie auto refresh is disabled by config")
+            return False
+
+        old_cookies = self._cookies
+        new_cookies = self.token_provider.get_cookie_string()
+        if not new_cookies:
+            logger.warning("WB full-cookie refresh failed: provider returned empty cookie string")
+            return False
+
+        self._cookies = new_cookies
+        self.last_refresh_changed = new_cookies != old_cookies
+        logger.info(
+            "WB full cookies refreshed in process memory | changed={} token={}",
+            self.last_refresh_changed,
+            self.get_masked_token(),
+        )
+        return True
 
     def refresh_x_wbaas_token(self) -> bool:
         """
-        Получает новый x_wbaas_token и обновляет cookies только в памяти.
+        Refresh only x_wbaas_token in the current raw cookie string.
 
-        В первой версии меняется только значение x_wbaas_token. Если после
-        refresh WB всё равно возвращает 498, это будет видно в логах; значит,
-        следующий шаг - обновлять всю cookie-сессию, а не один параметр.
+        This narrow fallback stays useful when a full cookie refresh is either
+        unavailable or too expensive for the current recovery path.
         """
         if not self.auto_refresh_enabled:
-            logger.warning("Автообновление x_wbaas_token отключено настройкой")
+            logger.warning("x_wbaas_token auto refresh is disabled by config")
             return False
 
         old_token = self.extract_cookie_value(self._cookies, self.cookie_name)
         new_token = self.token_provider.get_x_wbaas_token()
         if not new_token:
-            logger.warning("x_wbaas_token не обновлён: provider вернул пустой токен")
+            logger.warning("x_wbaas_token was not refreshed: provider returned empty token")
             return False
 
         self._cookies = self.replace_cookie_value(
@@ -58,7 +80,7 @@ class WbCookieManager:
         )
         self.last_refresh_changed = new_token != old_token
         logger.info(
-            "Cookies обновлены в памяти процесса | {}={} | changed={}",
+            "Cookies refreshed in process memory | {}={} | changed={}",
             self.cookie_name,
             self.mask_token(new_token),
             self.last_refresh_changed,
@@ -71,7 +93,7 @@ class WbCookieManager:
         cookie_name: str,
         new_value: str,
     ) -> str:
-        """Заменяет cookie по имени или добавляет его, если в строке его нет."""
+        """Replace cookie by name or append it if it does not exist yet."""
         cookie_parts = []
         replaced = False
 
@@ -93,14 +115,14 @@ class WbCookieManager:
         return "; ".join(cookie_parts)
 
     def get_masked_token(self) -> str:
-        """Возвращает маскированный текущий токен для безопасной диагностики."""
+        """Return masked current token for safe diagnostics."""
         return self.mask_token(
             self.extract_cookie_value(self._cookies, self.cookie_name) or ""
         )
 
     @staticmethod
     def extract_cookie_value(raw_cookies: str, cookie_name: str) -> Optional[str]:
-        """Достаёт значение cookie из raw string без логирования всей строки."""
+        """Extract one cookie value from raw string without logging the whole cookie."""
         for part in raw_cookies.split(";"):
             key, separator, value = part.strip().partition("=")
             if separator and key == cookie_name:
@@ -109,7 +131,7 @@ class WbCookieManager:
 
     @staticmethod
     def mask_token(token: str) -> str:
-        """Маскирует токен, чтобы он не попал в логи целиком."""
+        """Mask token so the full runtime secret never appears in logs."""
         if not token:
             return "<empty>"
         if len(token) <= 10:

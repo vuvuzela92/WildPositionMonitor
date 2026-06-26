@@ -16,6 +16,8 @@ WARNING:
 """
 
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -62,11 +64,37 @@ POSTGRES_DB = os.getenv("POSTGRES_DB")
 
 # Wildberries HTTP endpoints.
 WB_DETAIL_URL = os.getenv("WB_DETAIL_URL", "https://card.wb.ru/cards/v4/detail")
+WB_U_CARD_DETAIL_URL = os.getenv(
+    "WB_U_CARD_DETAIL_URL",
+    "https://www.wildberries.ru/__internal/u-card/cards/v4/detail",
+)
 WB_SIMILAR_URL = os.getenv("WB_SIMILAR_URL", "https://recom.wb.ru/recom/ru/common/v5/search")
 WB_DEFAULT_DEST = os.getenv("WB_DEFAULT_DEST", "-1257786")
+WB_DETAIL_ENDPOINT_MODE = os.getenv("WB_DETAIL_ENDPOINT_MODE", "card_v4")
+WB_ALLOW_MISSING_PRICE = os.getenv("WB_ALLOW_MISSING_PRICE", "False").lower() == "true"
+WB_ALLOW_MISSING_PRODUCT = os.getenv("WB_ALLOW_MISSING_PRODUCT", "False").lower() == "true"
 
 # Таймаут запроса (сек). Влияет на время ожидания curl_cffi AsyncSession.
 WB_TIMEOUT = int(os.getenv("WB_TIMEOUT", "10"))
+WB_COOKIE = os.getenv("WB_COOKIE", "")
+WB_COOKIE_ENABLED = os.getenv("WB_COOKIE_ENABLED", "False").lower() == "true"
+WB_DEVICE_ID = os.getenv("WB_DEVICE_ID", "")
+WB_PROXY_URL = os.getenv("WB_PROXY_URL", "")
+WB_PROXY_BUNDLES_ENABLED = os.getenv("WB_PROXY_BUNDLES_ENABLED", "False").lower() == "true"
+WB_PROXY_ROTATE_ON_CIRCUIT = os.getenv("WB_PROXY_ROTATE_ON_CIRCUIT", "True").lower() == "true"
+WB_TOKEN_AUTO_REFRESH_ENABLED = os.getenv("WB_TOKEN_AUTO_REFRESH_ENABLED", "False").lower() == "true"
+WB_TOKEN_COOKIE_NAME = os.getenv("WB_TOKEN_COOKIE_NAME", "x_wbaas_token")
+WB_TOKEN_REFRESH_URL = os.getenv("WB_TOKEN_REFRESH_URL", "https://www.wildberries.ru/")
+WB_TOKEN_REFRESH_MAX_ATTEMPTS = int(os.getenv("WB_TOKEN_REFRESH_MAX_ATTEMPTS", "3"))
+WB_TOKEN_REFRESH_WAIT_SECONDS = int(os.getenv("WB_TOKEN_REFRESH_WAIT_SECONDS", "5"))
+WB_USER_AGENT = os.getenv(
+    "WB_USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/146.0.0.0 YaBrowser/26.4.0.0 Safari/537.36"
+    ),
+)
 
 # Retry-параметры. WARNING: агрессивные значения могут усилить блокировки,
 # слишком мягкие — ухудшить полноту данных при транзиентных сбоях.
@@ -89,6 +117,8 @@ WB_SESSION_ROTATION_SCOPE = os.getenv("WB_SESSION_ROTATION_SCOPE", "detail")
 WB_SAFE_CONCURRENCY_LIMIT = int(os.getenv("WB_SAFE_CONCURRENCY_LIMIT", "2"))
 WB_SAFE_REQUEST_DELAY = float(os.getenv("WB_SAFE_REQUEST_DELAY", "0.25"))
 WB_ROLLOUT_ARTICLES_LIMIT = int(os.getenv("WB_ROLLOUT_ARTICLES_LIMIT", "0"))
+WB_DETAIL_SUBMIT_DELAY = float(os.getenv("WB_DETAIL_SUBMIT_DELAY", "0"))
+WB_SKIP_SIMILAR_STAGE = os.getenv("WB_SKIP_SIMILAR_STAGE", "False").lower() == "true"
 
 # Батчинг и конкурентность.
 # WARNING: повышение значений без A/B-проверки может изменить timing profile
@@ -103,3 +133,43 @@ DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
 # Retry для Google Sheets (синхронный клиент gspread в текущей реализации).
 GOOGLE_MAX_RETRIES = int(os.getenv("GOOGLE_MAX_RETRIES", "10"))
 GOOGLE_RETRY_DELAY = int(os.getenv("GOOGLE_RETRY_DELAY", "3"))
+
+
+@dataclass(frozen=True)
+class WBProxyBundle:
+    """Описывает один согласованный proxy/session bundle для WB."""
+
+    label: str
+    proxy_url: str
+    cookie: str
+    device_id: str
+
+
+def _load_wb_proxy_bundles() -> list[WBProxyBundle]:
+    """Читает proxy bundles из окружения по шаблону `WB_PROXY_XX_*`."""
+    bundle_indexes: set[str] = set()
+    pattern = re.compile(r"^WB_PROXY_(\d{2})_URL$")
+    for key in os.environ:
+        match = pattern.match(key)
+        if match:
+            bundle_indexes.add(match.group(1))
+
+    bundles: list[WBProxyBundle] = []
+    for index in sorted(bundle_indexes):
+        proxy_url = os.getenv(f"WB_PROXY_{index}_URL", "").strip()
+        cookie = os.getenv(f"WB_PROXY_{index}_COOKIE", "").strip()
+        device_id = os.getenv(f"WB_PROXY_{index}_DEVICE_ID", "").strip()
+        if not proxy_url or not cookie or not device_id:
+            continue
+        bundles.append(
+            WBProxyBundle(
+                label=f"proxy_{index}",
+                proxy_url=proxy_url,
+                cookie=cookie,
+                device_id=device_id,
+            )
+        )
+    return bundles
+
+
+WB_PROXY_BUNDLES = _load_wb_proxy_bundles()

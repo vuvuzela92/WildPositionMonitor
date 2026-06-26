@@ -49,7 +49,12 @@ from src.config import (
     POSTGRES_PASSWORD,
     POSTGRES_PORT,
     POSTGRES_USER,
+    WB_ALLOW_MISSING_PRODUCT,
+    WB_ALLOW_MISSING_PRICE,
+    WB_DETAIL_ENDPOINT_MODE,
     WB_ROLLOUT_ARTICLES_LIMIT,
+    WB_DETAIL_SUBMIT_DELAY,
+    WB_SKIP_SIMILAR_STAGE,
 )
 from src.data_models import ProcessingResult, RuntimeMetrics
 from src.db.clickhouse_client import ClickHouseClient
@@ -248,6 +253,7 @@ class WildPosition:
                 )
                 limited_articles = min(prepared_articles, WB_ROLLOUT_ARTICLES_LIMIT)
                 filtered_articles = filtered_articles[:WB_ROLLOUT_ARTICLES_LIMIT]
+                self._restrict_checkpoint_to_selected_articles(filtered_articles)
                 logger.info(
                     "Rollout limit applied: prepared_articles={} limited_articles={} excluded_by_rollout_limit={}",
                     prepared_articles,
@@ -448,6 +454,28 @@ class WildPosition:
         self.checkpoint_store.save(self.checkpoint_state)
         return [indexed[article_id] for article_id in target_ids if article_id in indexed]
 
+    def _restrict_checkpoint_to_selected_articles(self, selected_articles: List[Dict[str, Any]]) -> None:
+        """Сужает transient checkpoint-state до реально выбранного лимитного поднабора.
+
+        Используется только для diagnostic/smoke запусков с rollout limit, чтобы
+        `pending` не раздувался до полного списка из Google Sheets.
+        Исторические `done`/`failed_terminal` не трогаем, чтобы не ломать семантику
+        обычных полноразмерных прогонов.
+        """
+        selected_task_keys = {
+            str(article.get("task_key") or build_task_key(article))
+            for article in selected_articles
+            if article.get("article_id")
+        }
+        self.checkpoint_state.pending &= selected_task_keys
+        self.checkpoint_state.in_progress &= selected_task_keys
+        self.checkpoint_state.failed_retriable = {
+            task_key: retries
+            for task_key, retries in self.checkpoint_state.failed_retriable.items()
+            if task_key in selected_task_keys
+        }
+        self.checkpoint_store.save(self.checkpoint_state)
+
     def _has_legacy_checkpoint_keys(self) -> bool:
         """Определяет, что checkpoint ещё использует старые ключи по одному article_id."""
         key_groups = (
@@ -471,10 +499,24 @@ class WildPosition:
         - сохраняется управляемая конкурентность внутри WB-сервиса через semaphore;
         - оркестратор остаётся простым и не дублирует ограничение конкуренции.
         """
-        tasks = [
-            self._process_single_article(article_info, our_articles, batch_num=batch_num)
-            for article_info in articles_data
-        ]
+        if WB_DETAIL_SUBMIT_DELAY > 0:
+            logger.info(
+                "WB detail submit delay enabled: delay={} batch_size={}",
+                WB_DETAIL_SUBMIT_DELAY,
+                len(articles_data),
+            )
+
+        tasks: List[asyncio.Task[ProcessingResult]] = []
+        total_articles = len(articles_data)
+        for index, article_info in enumerate(articles_data, start=1):
+            task = asyncio.create_task(
+                self._process_single_article(article_info, our_articles, batch_num=batch_num)
+            )
+            tasks.append(task)
+
+            if WB_DETAIL_SUBMIT_DELAY > 0 and index < total_articles:
+                await asyncio.sleep(WB_DETAIL_SUBMIT_DELAY)
+
         results = await asyncio.gather(*tasks)
         return results
 
@@ -530,6 +572,26 @@ class WildPosition:
             payload = product_response.payload or {}
             product = self.wb_service.parse_product_details(payload)
             if not product:
+                if WB_ALLOW_MISSING_PRODUCT and WB_DETAIL_ENDPOINT_MODE == "u_card_v4":
+                    self.metrics.batch_successful_items += 1
+                    logger.warning(
+                        "Карточка WB отсутствует или не распарсилась, пропуск разрешен: request_id={} article_id={} task_key={} status=ok_missing_product",
+                        request_id,
+                        article_id,
+                        task_key,
+                    )
+                    return ProcessingResult(
+                        article_id=article_id,
+                        task_key=task_key,
+                        status="ok",
+                        price=None,
+                        found_article=None,
+                        position=None,
+                        processed_at=datetime.now(),
+                        error="missing_product_allowed",
+                        wild=wild_value,
+                        concurrent=competitor_status,
+                    )
                 return self._failed_result(
                     article_id=article_id,
                     task_key=task_key,
@@ -547,20 +609,27 @@ class WildPosition:
                     product.price,
                 )
 
-            similar = await self.wb_service.get_similar_products(product, request_id=request_id)
-            self._collect_similar_metrics(similar)
-            if similar.error:
-                return self._failed_result(
-                    article_id=article_id,
-                    task_key=task_key,
-                    status="similar_fetch_error",
-                    message=similar.error,
-                    wild=wild_value,
-                    competitor_status=competitor_status,
-                    price=product.price,
+            if WB_SKIP_SIMILAR_STAGE:
+                logger.warning(
+                    "Similar stage skipped by config: request_id={} article_id={}",
+                    request_id,
+                    article_id,
                 )
-
-            found_id, position = self.wb_service.find_our_article_in_similar(similar, our_articles)
+                similar = None
+                found_id, position = None, None
+            else:
+                similar = await self.wb_service.get_similar_products(product, request_id=request_id)
+                self._collect_similar_metrics(similar)
+                if similar.error:
+                    logger.warning(
+                        "Similar stage soft-failed: request_id={} article_id={} error={}",
+                        request_id,
+                        article_id,
+                        similar.error,
+                    )
+                    found_id, position = None, None
+                else:
+                    found_id, position = self.wb_service.find_our_article_in_similar(similar, our_articles)
             if found_id:
                 logger.info(
                     "Найден наш артикул: request_id={} article_id={} found_article={} position={}",
@@ -570,6 +639,41 @@ class WildPosition:
                     position,
                 )
             if product.price is None:
+                if WB_ALLOW_MISSING_PRICE and WB_DETAIL_ENDPOINT_MODE == "u_card_v4":
+                    self.metrics.batch_successful_items += 1
+                    self._log_price_not_found(
+                        request_id=request_id,
+                        article_id=article_id,
+                        task_key=task_key,
+                        product=product,
+                        wild=wild_value,
+                        competitor_status=competitor_status,
+                    )
+                    logger.info(
+                        "Итог по артикулу: task_key={} article_id={} price=None status=ok_missing_price found_article={} position={} wild={} competitor_status={}",
+                        task_key,
+                        article_id,
+                        found_id,
+                        position,
+                        wild_value,
+                        competitor_status,
+                    )
+                    return ProcessingResult(
+                        article_id=article_id,
+                        task_key=task_key,
+                        status="ok",
+                        price=None,
+                        found_article=found_id,
+                        position=position,
+                        processed_at=datetime.now(),
+                        error=(
+                            "missing_price_allowed"
+                            if WB_SKIP_SIMILAR_STAGE or not similar or not similar.error
+                            else f"missing_price_allowed:similar_soft_error:{similar.error}"
+                        ),
+                        wild=wild_value,
+                        concurrent=competitor_status,
+                    )
                 self.metrics.batch_failed_items += 1
                 self._log_price_not_found(
                     request_id=request_id,
@@ -625,6 +729,11 @@ class WildPosition:
                 found_article=found_id,
                 position=position,
                 processed_at=datetime.now(),
+                error=(
+                    "similar_stage_skipped"
+                    if WB_SKIP_SIMILAR_STAGE
+                    else f"similar_soft_error:{similar.error}" if similar and similar.error else None
+                ),
                 wild=wild_value,
                 concurrent=competitor_status,
             )
@@ -754,8 +863,15 @@ class WildPosition:
         """
         for result in batch_results:
             task_key = str(result.task_key or result.article_id)
-            if not result.error:
+            # Финализируем transient-состояние батча независимо от исхода:
+            # задача больше не должна оставаться в in_progress после обработки.
+            self.checkpoint_state.in_progress.discard(task_key)
+            # Для checkpoint опираемся на business-status результата, а не на наличие
+            # soft diagnostic-маркеров в `error` (`missing_price_allowed`,
+            # `missing_product_allowed`, `similar_stage_skipped` и т.п.).
+            if result.status == "ok":
                 self.checkpoint_state.done.add(task_key)
+                self.checkpoint_state.pending.discard(task_key)
                 self.checkpoint_state.failed_retriable.pop(task_key, None)
                 self.checkpoint_state.failed_terminal.discard(task_key)
                 continue
@@ -765,15 +881,20 @@ class WildPosition:
                 for key in ("rate_limited", "forbidden", "upstream_5xx", "timeout", "network_error", "circuit_open")
             )
             if is_retriable:
+                self.checkpoint_state.done.discard(task_key)
+                self.checkpoint_state.failed_terminal.discard(task_key)
                 retries = self.checkpoint_state.failed_retriable.get(task_key, 0) + 1
                 self.checkpoint_state.failed_retriable[task_key] = retries
                 if retries > self.max_retry_per_item:
                     self.checkpoint_state.failed_terminal.add(task_key)
+                    self.checkpoint_state.pending.discard(task_key)
                     self.checkpoint_state.failed_retriable.pop(task_key, None)
                 else:
                     self.checkpoint_state.pending.add(task_key)
             else:
+                self.checkpoint_state.done.discard(task_key)
                 self.checkpoint_state.failed_terminal.add(task_key)
+                self.checkpoint_state.pending.discard(task_key)
                 self.checkpoint_state.failed_retriable.pop(task_key, None)
 
         self.checkpoint_store.save(self.checkpoint_state)

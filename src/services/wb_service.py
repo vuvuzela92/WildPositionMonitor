@@ -24,6 +24,7 @@ import random
 import time
 from collections import deque
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import Timeout
@@ -32,20 +33,38 @@ from loguru import logger
 from src.config import (
     CONCURRENT_REQUESTS_LIMIT,
     WB_CIRCUIT_COOLDOWN,
+    WB_PROXY_BUNDLES,
+    WB_PROXY_BUNDLES_ENABLED,
+    WB_PROXY_ROTATE_ON_CIRCUIT,
+    WB_COOKIE,
+    WB_COOKIE_ENABLED,
     WB_DEFAULT_DEST,
+    WB_DETAIL_ENDPOINT_MODE,
     WB_DETAIL_URL,
+    WB_DEVICE_ID,
     WB_FORBIDDEN_THRESHOLD,
     WB_MAX_RETRIES,
     WB_MAX_RPS,
+    WB_PROXY_URL,
     WB_RATE_LIMIT_DELAY,
     WB_RETRY_DELAY,
     WB_SESSION_ROTATE_EVERY,
     WB_SESSION_ROTATION_ENABLED,
     WB_SESSION_ROTATION_SCOPE,
     WB_SIMILAR_URL,
+    WB_TOKEN_AUTO_REFRESH_ENABLED,
+    WB_TOKEN_COOKIE_NAME,
+    WB_TOKEN_REFRESH_MAX_ATTEMPTS,
+    WB_TOKEN_REFRESH_URL,
+    WB_TOKEN_REFRESH_WAIT_SECONDS,
     WB_TIMEOUT,
+    WB_U_CARD_DETAIL_URL,
+    WB_USER_AGENT,
+    WBProxyBundle,
 )
 from src.data_models import ProductDetails, SimilarProductsResult, WBRequestResult
+from src.wb_cookie_manager import WbCookieManager
+from src.wb_token_provider import WbTokenProvider
 
 
 class WildberriesService:
@@ -94,6 +113,30 @@ class WildberriesService:
         self.max_retries = max(1, WB_MAX_RETRIES)
         self.base_retry_delay = max(0.2, float(WB_RETRY_DELAY))
         self.timeout = max(1, int(WB_TIMEOUT))
+        self.detail_endpoint_mode = (WB_DETAIL_ENDPOINT_MODE or "card_v4").strip().lower()
+        self._bundle_rotation_enabled = WB_PROXY_BUNDLES_ENABLED and bool(WB_PROXY_BUNDLES)
+        self._bundle_rotate_on_circuit = WB_PROXY_ROTATE_ON_CIRCUIT
+        self._proxy_bundles: List[WBProxyBundle] = list(WB_PROXY_BUNDLES)
+        self._active_bundle_index = 0
+        self._bundle_rotation_requested = False
+        self._bundle_rotation_reason = ""
+        self._bundle_rotations_total = 0
+        self._token_refresh_enabled = WB_TOKEN_AUTO_REFRESH_ENABLED
+        self._token_refresh_lock = asyncio.Lock()
+        self._cookie_manager: Optional[WbCookieManager] = None
+        self.cookie_enabled = False
+        self.raw_cookie = ""
+        self.device_id = ""
+        self.proxy_url = ""
+        self.proxy_host = ""
+        self._apply_runtime_identity(
+            cookie=WB_COOKIE,
+            cookie_enabled=WB_COOKIE_ENABLED,
+            device_id=WB_DEVICE_ID,
+            proxy_url=WB_PROXY_URL,
+        )
+        if self._bundle_rotation_enabled:
+            self._apply_bundle(self._active_bundle_index, reason="initial_bundle")
 
         # Circuit breaker параметры для серии forbidden-ответов.
         self.forbidden_threshold = max(1, WB_FORBIDDEN_THRESHOLD)
@@ -117,6 +160,265 @@ class WildberriesService:
             "Referer": "https://www.wildberries.ru/",
         }
 
+    def _apply_runtime_identity(
+        self,
+        *,
+        cookie: str,
+        cookie_enabled: bool,
+        device_id: str,
+        proxy_url: str,
+    ) -> None:
+        """Применяет текущий proxy/session context без раскрытия секретов."""
+        normalized_cookie = cookie.strip()
+        self.cookie_enabled = cookie_enabled and bool(normalized_cookie)
+        self.raw_cookie = normalized_cookie if self.cookie_enabled else ""
+        self.device_id = device_id.strip()
+        self.proxy_url = proxy_url.strip()
+        self.proxy_host = self._extract_proxy_host(self.proxy_url)
+        self._cookie_manager = self._build_cookie_manager()
+
+    def _apply_bundle(self, index: int, *, reason: str) -> None:
+        """Применяет один согласованный proxy bundle."""
+        bundle = self._proxy_bundles[index]
+        self._active_bundle_index = index
+        self._apply_runtime_identity(
+            cookie=bundle.cookie,
+            cookie_enabled=True,
+            device_id=bundle.device_id,
+            proxy_url=bundle.proxy_url,
+        )
+        self.logger.info(
+            "WB proxy bundle applied label={} index={} total={} reason={} proxy_host={}",
+            bundle.label,
+            index + 1,
+            len(self._proxy_bundles),
+            reason,
+            self.proxy_host or "-",
+        )
+
+    def _build_token_provider(self) -> WbTokenProvider:
+        """Создаёт token provider для текущего proxy/session context."""
+        return WbTokenProvider(
+            user_agent=WB_USER_AGENT,
+            url=WB_TOKEN_REFRESH_URL,
+            cookie_name=WB_TOKEN_COOKIE_NAME,
+            max_attempts=WB_TOKEN_REFRESH_MAX_ATTEMPTS,
+            wait_seconds=WB_TOKEN_REFRESH_WAIT_SECONDS,
+            proxy=self.proxy_url or None,
+        )
+
+    def _build_cookie_manager(self) -> Optional[WbCookieManager]:
+        """Создаёт runtime-менеджер cookies для текущего bundle."""
+        if not self.cookie_enabled or not self.raw_cookie:
+            return None
+        return WbCookieManager(
+            raw_cookies=self.raw_cookie,
+            token_provider=self._build_token_provider(),
+            cookie_name=WB_TOKEN_COOKIE_NAME,
+            auto_refresh_enabled=self._token_refresh_enabled,
+        )
+
+    def _update_runtime_cookie(self, new_cookie: str) -> None:
+        """Обновляет cookie в runtime и в активном bundle без записи в .env."""
+        self._apply_runtime_identity(
+            cookie=new_cookie,
+            cookie_enabled=True,
+            device_id=self.device_id,
+            proxy_url=self.proxy_url,
+        )
+        if self._bundle_rotation_enabled and self._proxy_bundles:
+            active_bundle = self._proxy_bundles[self._active_bundle_index]
+            self._proxy_bundles[self._active_bundle_index] = WBProxyBundle(
+                label=active_bundle.label,
+                proxy_url=active_bundle.proxy_url,
+                cookie=new_cookie,
+                device_id=active_bundle.device_id,
+            )
+
+    async def _refresh_cookie_token(
+        self,
+        *,
+        request_id: str,
+        endpoint: str,
+        failed_cookie: str,
+    ) -> bool:
+        """Пытается обновить только x_wbaas_token для текущего bundle."""
+        if not self._token_refresh_enabled or endpoint != "u_card_detail_v4":
+            return False
+
+        async with self._token_refresh_lock:
+            if not self._cookie_manager:
+                self.logger.warning(
+                    "WB token refresh skipped: request_id={} reason=no_cookie_manager",
+                    request_id,
+                )
+                return False
+
+            if failed_cookie and self.raw_cookie and failed_cookie != self.raw_cookie:
+                self.logger.info(
+                    "WB token refresh reused existing updated cookie: request_id={}",
+                    request_id,
+                )
+                return True
+
+            refreshed = await asyncio.to_thread(self._cookie_manager.refresh_full_cookies)
+            refresh_mode = "full_cookie"
+            if not refreshed:
+                refreshed = await asyncio.to_thread(self._cookie_manager.refresh_x_wbaas_token)
+                refresh_mode = "token_only"
+            if not refreshed:
+                self.logger.warning(
+                    "WB token refresh failed: request_id={} proxy_host={}",
+                    request_id,
+                    self.proxy_host or "-",
+                )
+                return False
+
+            refreshed_cookie = self._cookie_manager.get_cookies()
+            self._update_runtime_cookie(refreshed_cookie)
+            self.logger.warning(
+                "WB token refresh applied: request_id={} proxy_host={} mode={} token_changed={}",
+                request_id,
+                self.proxy_host or "-",
+                refresh_mode,
+                self._cookie_manager.last_refresh_changed,
+            )
+            return True
+
+    def _has_next_bundle(self) -> bool:
+        """Возвращает `True`, если доступен следующий bundle."""
+        return self._bundle_rotation_enabled and self._active_bundle_index + 1 < len(self._proxy_bundles)
+
+    def _schedule_bundle_rotation(self, *, reason: str) -> None:
+        """Планирует переключение на следующий bundle при следующем lease."""
+        if not self._has_next_bundle():
+            self.logger.warning(
+                "WB proxy bundle rotation skipped: reason={} active_index={} total={}",
+                reason,
+                self._active_bundle_index + 1,
+                len(self._proxy_bundles),
+            )
+            return
+        if self._bundle_rotation_requested:
+            return
+        self._bundle_rotation_requested = True
+        self._bundle_rotation_reason = reason
+        self.logger.warning(
+            "WB proxy bundle rotation scheduled: reason={} next_index={} total={}",
+            reason,
+            self._active_bundle_index + 2,
+            len(self._proxy_bundles),
+        )
+
+    def _build_detail_request_headers(self, product_id: int) -> Optional[Dict[str, str]]:
+        """Возвращает минимальный cookie-only контур для detail endpoint."""
+        if not self.cookie_enabled:
+            return None
+        if self.detail_endpoint_mode == "u_card_v4":
+            return self._build_u_card_detail_request_headers(product_id)
+        return {
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Content-Type": "application/json",
+            "Cookie": self.raw_cookie,
+            "Origin": "https://www.wildberries.ru",
+            "Pragma": "no-cache",
+            "Referer": f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
+            "Sec-CH-UA": '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
+            "Sec-CH-UA-Mobile": "?1",
+            "Sec-CH-UA-Platform": '"Android"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 10; K) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/137.0.0.0 Mobile Safari/537.36"
+            ),
+        }
+
+    def _build_u_card_detail_request_headers(self, product_id: int) -> Optional[Dict[str, str]]:
+        """Возвращает browser-parity контур для u_card detail endpoint."""
+        if not self.cookie_enabled or not self.device_id:
+            return None
+        return {
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "ru,en;q=0.9",
+            "Cookie": self.raw_cookie,
+            "Priority": "u=1, i",
+            "Referer": f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
+            "Sec-CH-UA": '"Chromium";v="146", "Not-A.Brand";v="24", "YaBrowser";v="26.4", "Yowser";v="2.5"',
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/146.0.0.0 YaBrowser/26.4.0.0 Safari/537.36"
+            ),
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Spa-Version": "14.14.2",
+            "deviceid": self.device_id,
+        }
+
+    def _build_recom_request_headers(self, product_id: int) -> Optional[Dict[str, str]]:
+        """Возвращает browser-like cookie-only контур для recom_search."""
+        if not self.cookie_enabled:
+            return None
+        return {
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Content-Type": "application/json",
+            "Cookie": self.raw_cookie,
+            "Origin": "https://www.wildberries.ru",
+            "Pragma": "no-cache",
+            "Referer": f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
+            "Sec-CH-UA": '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
+            "Sec-CH-UA-Mobile": "?1",
+            "Sec-CH-UA-Platform": '"Android"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 10; K) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/137.0.0.0 Mobile Safari/537.36"
+            ),
+        }
+
+    def _rebuild_request_headers(
+        self,
+        *,
+        endpoint: str,
+        product_id: Optional[int],
+    ) -> Optional[Dict[str, str]]:
+        """Пересобирает headers после runtime-обновления cookie/token."""
+        if product_id is None:
+            return None
+        if endpoint == "u_card_detail_v4":
+            return self._build_u_card_detail_request_headers(product_id)
+        if endpoint == "card_detail_v4":
+            return self._build_detail_request_headers(product_id)
+        return None
+
+    @staticmethod
+    def _extract_proxy_host(proxy_url: str) -> str:
+        """Возвращает host:port proxy без user/password для безопасного логирования."""
+        if not proxy_url:
+            return ""
+        parsed = urlsplit(proxy_url)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return host
+
     async def _create_session(self) -> AsyncSession:
         """Создаёт новую AsyncSession для будущей ротации."""
         generation = self._session_generation + 1
@@ -125,13 +427,21 @@ class WildberriesService:
                 impersonate="chrome120",
                 timeout=self.timeout,
                 headers=self.default_headers,
+                trust_env=False,
+                proxy=self.proxy_url or None,
             )
         except Exception as exc:
             self._session_creation_failures_total += 1
             self.logger.exception("WB session creation failed generation={} error={}", generation, exc)
             raise
 
-        self.logger.info("WB session created generation={}", generation)
+        self.logger.info(
+            "WB session created generation={} detail_endpoint_mode={} proxy_enabled={} proxy_host={}",
+            generation,
+            self.detail_endpoint_mode,
+            bool(self.proxy_url),
+            self.proxy_host or "-",
+        )
         return session
 
     def _should_rotate_session(self) -> bool:
@@ -182,6 +492,53 @@ class WildberriesService:
             len(self._retired_sessions),
         )
 
+    async def _rotate_bundle_if_needed(self) -> None:
+        """Переключает active session на следующий proxy bundle при деградации."""
+        if not self._bundle_rotation_requested or not self._has_next_bundle():
+            return
+
+        old_session = self.session
+        old_generation = self._session_generation
+        old_bundle_index = self._active_bundle_index
+        reason = self._bundle_rotation_reason or "bundle_rotation_requested"
+
+        self._apply_bundle(old_bundle_index + 1, reason=reason)
+        self._bundle_rotation_requested = False
+        self._bundle_rotation_reason = ""
+
+        try:
+            new_session = await self._create_session()
+        except Exception:
+            self._bundle_rotation_requested = True
+            self._bundle_rotation_reason = reason
+            self._apply_bundle(old_bundle_index, reason="bundle_rotation_revert")
+            raise
+
+        if old_session is not None:
+            self._retired_sessions[old_generation] = old_session
+
+        new_generation = old_generation + 1
+        self.session = new_session
+        self._session_generation = new_generation
+        self._session_request_count = 0
+        self._session_inflight_by_generation.setdefault(new_generation, 0)
+        self._bundle_rotations_total += 1
+        self._session_rotations_total += 1
+        self._session_retired_max = max(self._session_retired_max, len(self._retired_sessions))
+        self.consecutive_forbidden = 0
+        self.circuit_open_until = 0.0
+        self.circuit_open_reason = ""
+        self.half_open_probe_in_flight = False
+        self._first_403_after_rotation_generation = None
+        self.logger.warning(
+            "WB proxy bundle rotated old_index={} new_index={} generation={} reason={} proxy_host={}",
+            old_bundle_index + 1,
+            self._active_bundle_index + 1,
+            new_generation,
+            reason,
+            self.proxy_host or "-",
+        )
+
     async def _acquire_session_lease(
         self,
         *,
@@ -191,6 +548,8 @@ class WildberriesService:
         async with self._session_lock:
             if self.session is None:
                 raise RuntimeError("WB session lease requested before session initialization")
+
+            await self._rotate_bundle_if_needed()
 
             if count_for_rotation:
                 self._session_request_count += 1
@@ -261,6 +620,10 @@ class WildberriesService:
             "session_rotations_total": self._session_rotations_total,
             "session_rotation_errors_total": self._session_rotation_errors_total,
             "session_creation_failures_total": self._session_creation_failures_total,
+            "bundle_rotation_enabled": self._bundle_rotation_enabled,
+            "bundle_rotations_total": self._bundle_rotations_total,
+            "bundle_active_index": self._active_bundle_index + 1 if self._proxy_bundles else 0,
+            "bundle_total": len(self._proxy_bundles),
             "session_retired_total": len(self._retired_sessions),
             "session_retired_inflight_current": self._current_retired_inflight(),
             "session_retired_max": self._session_retired_max,
@@ -351,16 +714,24 @@ class WildberriesService:
             "lang": "ru",
             "nm": product_id,
         }
+        detail_url = WB_DETAIL_URL
+        detail_endpoint = "card_detail_v4"
+        if self.detail_endpoint_mode == "u_card_v4":
+            detail_url = WB_U_CARD_DETAIL_URL
+            detail_endpoint = "u_card_detail_v4"
+            detail_params["hide_dtype"] = 15
+            detail_params["mtype"] = 257
         detail_session, detail_generation = await self._acquire_session_lease(
             count_for_rotation=True,
         )
         try:
             detail_response = await self._request_with_retry(
-                url=WB_DETAIL_URL,
-                endpoint="card_detail_v4",
+                url=detail_url,
+                endpoint=detail_endpoint,
                 request_id=request_id,
                 params=detail_params,
                 context={"article_id": product_id},
+                request_headers=self._build_detail_request_headers(product_id),
                 session=detail_session,
                 session_generation=detail_generation,
             )
@@ -425,6 +796,7 @@ class WildberriesService:
                 request_id=request_id,
                 params=params,
                 context={"article_id": product.id},
+                request_headers=self._build_recom_request_headers(product.id),
                 session=session,
                 session_generation=generation,
             )
@@ -471,6 +843,60 @@ class WildberriesService:
                 return article_id, idx
         return None, None
 
+    @staticmethod
+    def _normalize_price_candidate(raw_price: Any) -> Optional[int]:
+        """Нормализует ценовой кандидат WB из minor-units формата."""
+        if not isinstance(raw_price, (int, float)):
+            return None
+        if raw_price <= 0:
+            return None
+        return int(raw_price) // 100
+
+    def _extract_price_from_size(self, size: Dict[str, Any]) -> Optional[int]:
+        """Пытается извлечь цену из size, nested price и stocks."""
+        candidate_fields = (
+            "product",
+            "price",
+            "finalPrice",
+            "salePrice",
+            "walletPrice",
+            "clientPrice",
+            "basic",
+            "total",
+            "sale",
+        )
+
+        for field_name in candidate_fields:
+            normalized = self._normalize_price_candidate(size.get(field_name))
+            if normalized is not None:
+                return normalized
+
+        price_info = size.get("price") or {}
+        if isinstance(price_info, dict):
+            for field_name in candidate_fields:
+                normalized = self._normalize_price_candidate(price_info.get(field_name))
+                if normalized is not None:
+                    return normalized
+
+        stocks = size.get("stocks")
+        if isinstance(stocks, list):
+            for stock in stocks:
+                if not isinstance(stock, dict):
+                    continue
+                for field_name in candidate_fields:
+                    normalized = self._normalize_price_candidate(stock.get(field_name))
+                    if normalized is not None:
+                        return normalized
+
+                stock_price = stock.get("price")
+                if isinstance(stock_price, dict):
+                    for field_name in candidate_fields:
+                        normalized = self._normalize_price_candidate(stock_price.get(field_name))
+                        if normalized is not None:
+                            return normalized
+
+        return None
+
     def parse_product_details(self, payload: Dict[str, Any]) -> Optional[ProductDetails]:
         """Нормализует payload карточки в `ProductDetails`.
 
@@ -499,6 +925,10 @@ class WildberriesService:
             for size in sizes:
                 if not isinstance(size, dict):
                     continue
+                extracted_price = self._extract_price_from_size(size)
+                if extracted_price is not None:
+                    price = extracted_price
+                    break
                 price_info = size.get("price") or {}
                 if not isinstance(price_info, dict):
                     continue
@@ -546,6 +976,8 @@ class WildberriesService:
 
             nested_price = size.get("price")
             nested_price_dict = nested_price if isinstance(nested_price, dict) else {}
+            stocks = size.get("stocks")
+            stock_items = stocks if isinstance(stocks, list) else []
             candidate_values: Dict[str, Any] = {}
             for field_name in candidate_fields:
                 if field_name in size and not isinstance(size[field_name], (dict, list)):
@@ -553,11 +985,33 @@ class WildberriesService:
                 if field_name in nested_price_dict and not isinstance(nested_price_dict[field_name], (dict, list)):
                     candidate_values[f"size.price.{field_name}"] = nested_price_dict[field_name]
 
+            stock_samples = []
+            for stock in stock_items[:2]:
+                if not isinstance(stock, dict):
+                    stock_samples.append({"stock_type": type(stock).__name__})
+                    continue
+                stock_price = stock.get("price")
+                stock_price_dict = stock_price if isinstance(stock_price, dict) else {}
+                stock_candidate_values: Dict[str, Any] = {}
+                for field_name in candidate_fields:
+                    if field_name in stock and not isinstance(stock[field_name], (dict, list)):
+                        stock_candidate_values[f"stock.{field_name}"] = stock[field_name]
+                    if field_name in stock_price_dict and not isinstance(stock_price_dict[field_name], (dict, list)):
+                        stock_candidate_values[f"stock.price.{field_name}"] = stock_price_dict[field_name]
+                stock_samples.append(
+                    {
+                        "stock_keys": sorted(stock.keys()),
+                        "stock_price_keys": sorted(stock_price_dict.keys()) if stock_price_dict else [],
+                        "stock_candidate_values": stock_candidate_values,
+                    }
+                )
+
             size_samples.append(
                 {
                     "size_keys": sorted(size.keys()),
                     "price_keys": sorted(nested_price_dict.keys()) if nested_price_dict else [],
                     "candidate_values": candidate_values,
+                    "stock_samples": stock_samples,
                 }
             )
 
@@ -576,6 +1030,7 @@ class WildberriesService:
         params: Optional[Dict[str, Any]] = None,
         context: Optional[Dict[str, Any]] = None,
         *,
+        request_headers: Optional[Dict[str, str]] = None,
         session: AsyncSession,
         session_generation: int,
     ) -> WBRequestResult:
@@ -615,7 +1070,16 @@ class WildberriesService:
             self.max_retries,
             context or {},
         )
+        if endpoint in {"card_detail_v4", "u_card_detail_v4"}:
+            self.logger.info(
+                "WB detail request context: request_id={} endpoint={} cookie_present={} deviceid_present={}",
+                request_id,
+                endpoint,
+                bool(request_headers and request_headers.get("Cookie")),
+                bool(request_headers and request_headers.get("deviceid")),
+            )
         last_result = WBRequestResult(ok=False, status_class="network_error", retriable=True)
+        token_refresh_attempted = False
         for attempt in range(1, self.max_retries + 1):
             # RPS-тормоз и небольшой jitter снижают burst-паттерн.
             await self._throttle()
@@ -624,7 +1088,7 @@ class WildberriesService:
             try:
                 # semaphore удерживает верхнюю границу конкурентности.
                 async with self.semaphore:
-                    response = await session.get(url, params=params)
+                    response = await session.get(url, params=params, headers=request_headers)
                 latency_ms = int((time.monotonic() - start) * 1000)
                 status_code = int(response.status_code)
                 status_class, retriable = self._classify_status(status_code)
@@ -663,6 +1127,40 @@ class WildberriesService:
                     latency_ms=latency_ms,
                     retries_used=retries_used,
                 )
+                if (
+                    status_code == 498
+                    and endpoint == "u_card_detail_v4"
+                    and not token_refresh_attempted
+                ):
+                    product_id: Optional[int] = None
+                    if context and context.get("article_id") is not None:
+                        try:
+                            product_id = int(context["article_id"])
+                        except (TypeError, ValueError):
+                            product_id = None
+
+                    refreshed = await self._refresh_cookie_token(
+                        request_id=request_id,
+                        endpoint=endpoint,
+                        failed_cookie=request_headers.get("Cookie", "") if request_headers else "",
+                    )
+                    if refreshed:
+                        rebuilt_headers = self._rebuild_request_headers(
+                            endpoint=endpoint,
+                            product_id=product_id,
+                        )
+                        if rebuilt_headers:
+                            request_headers = rebuilt_headers
+                            token_refresh_attempted = True
+                            self.logger.warning(
+                                "WB request will retry after token refresh: request_id={} endpoint={} product_id={}",
+                                request_id,
+                                endpoint,
+                                product_id or "-",
+                            )
+                            await asyncio.sleep(0.2)
+                            continue
+
                 if status_class == "forbidden":
                     self.consecutive_forbidden += 1
                     if (
@@ -832,6 +1330,8 @@ class WildberriesService:
         self.circuit_open_until = time.monotonic() + self.cooldown_seconds
         self.circuit_open_reason = reason
         self.half_open_probe_in_flight = False
+        if self._bundle_rotate_on_circuit:
+            self._schedule_bundle_rotation(reason=reason)
         self.logger.warning(
             "Открыт circuit breaker WB: cooldown_s={} reason={}",
             self.cooldown_seconds,
