@@ -10,6 +10,7 @@ browser cookies, and returns either a full raw cookie string or a single
 from __future__ import annotations
 
 import time
+from urllib.parse import urlparse
 from typing import Optional
 
 from loguru import logger
@@ -17,6 +18,8 @@ from loguru import logger
 
 class WbTokenProvider:
     """Get runtime WB cookies and x_wbaas_token from SeleniumBase."""
+
+    DEFAULT_DETAIL_PAGE_URL = "https://www.wildberries.ru/catalog/233113562/detail.aspx"
 
     def __init__(
         self,
@@ -33,6 +36,21 @@ class WbTokenProvider:
         self.max_attempts = max_attempts
         self.wait_seconds = wait_seconds
         self.proxy = proxy
+        self._last_diagnostics: dict[str, object] = {
+            "cookies_count": 0,
+            "token_present": False,
+            "document_cookie_len": 0,
+            "page_source_len": 0,
+            "ready_state": "",
+            "page_hint": "",
+            "final_url": "",
+            "title": "",
+            "error": "",
+        }
+
+    def get_last_diagnostics(self) -> dict[str, object]:
+        """Return the latest safe browser-refresh diagnostics snapshot."""
+        return dict(self._last_diagnostics)
 
     def get_x_wbaas_token(self) -> Optional[str]:
         """Return only x_wbaas_token from a freshly collected cookie bundle."""
@@ -71,13 +89,15 @@ class WbTokenProvider:
                 agent=self.user_agent,
                 proxy=self.proxy,
             )
-            driver.get(self.url)
+            driver.get(self._get_home_url())
             self._wait_for_dom_ready(driver, timeout_seconds=self.wait_seconds)
             self._log_browser_state(driver, stage="initial_open")
 
             for attempt in range(1, self.max_attempts + 1):
-                if attempt == 2:
-                    self._warmup_homepage(driver)
+                if attempt == 1:
+                    self._open_detail_page(driver)
+                elif attempt == 2:
+                    self._warmup_flow(driver)
                 elif attempt == 3:
                     self._refresh_page(driver)
 
@@ -85,6 +105,18 @@ class WbTokenProvider:
                 cookies = self._collect_cookies(driver)
                 raw_cookie_string = self._build_cookie_string(cookies)
                 if raw_cookie_string:
+                    cookie_names = {str(cookie.get("name") or "") for cookie in cookies}
+                    self._set_diagnostics(error="")
+                    self._set_diagnostics(
+                        cookies_count=len(cookies),
+                        token_present=self.cookie_name in cookie_names,
+                        document_cookie_len=self._get_document_cookie_len(driver),
+                        page_source_len=self._get_page_source_len(driver),
+                        ready_state=self._get_ready_state(driver),
+                        page_hint=self._get_page_hint(driver),
+                        final_url=str(getattr(driver, "current_url", "") or "")[:200],
+                        title=str(getattr(driver, "title", "") or "").strip()[:120],
+                    )
                     logger.info(
                         "Fresh WB cookie bundle received | cookies_count={} x_wbaas_token_present={}",
                         len(cookies),
@@ -101,9 +133,11 @@ class WbTokenProvider:
                 time.sleep(self.wait_seconds)
 
             logger.warning("WB cookies were not found after SeleniumBase refresh")
+            self._set_diagnostics(error="cookies_not_found")
             return None
         except Exception as exc:
             logger.error("SeleniumBase cookie refresh failed: {}", exc)
+            self._set_diagnostics(error=str(exc))
             return None
         finally:
             if driver is not None:
@@ -166,10 +200,26 @@ class WbTokenProvider:
     def _warmup_homepage(self, driver: object) -> None:
         """Retry cookie bootstrap from the WB homepage."""
         try:
-            driver.get("https://www.wildberries.ru/")
+            driver.get(self._get_home_url())
             logger.info("WB cookie refresh warmup: homepage reopened")
         except Exception as exc:
             logger.warning("WB cookie refresh homepage warmup failed: {}", exc)
+
+    def _open_detail_page(self, driver: object) -> None:
+        """Open a real product card page to get a browser-like WB session context."""
+        try:
+            detail_url = self._get_detail_page_url()
+            driver.get(detail_url)
+            logger.info("WB cookie refresh warmup: detail page opened url={}", detail_url)
+        except Exception as exc:
+            logger.warning("WB cookie refresh detail-page open failed: {}", exc)
+
+    def _warmup_flow(self, driver: object) -> None:
+        """Run a lightweight browser-like sequence homepage -> detail page."""
+        self._warmup_homepage(driver)
+        self._wait_for_dom_ready(driver, timeout_seconds=self.wait_seconds)
+        time.sleep(1.0)
+        self._open_detail_page(driver)
 
     def _refresh_page(self, driver: object) -> None:
         """Reload the current page as the final lightweight retry step."""
@@ -187,19 +237,39 @@ class WbTokenProvider:
             title = str(getattr(driver, "title", "") or "").strip()
             ready_state = self._get_ready_state(driver)
             page_hint = self._get_page_hint(driver)
+            page_source_len = self._get_page_source_len(driver)
+            document_cookie_len = self._get_document_cookie_len(driver)
             cookie_names = {str(cookie.get("name") or "") for cookie in cookies}
+            self._set_diagnostics(
+                cookies_count=len(cookies),
+                token_present=self.cookie_name in cookie_names,
+                document_cookie_len=document_cookie_len,
+                page_source_len=page_source_len,
+                ready_state=ready_state,
+                page_hint=page_hint,
+                final_url=current_url[:200],
+                title=title[:120],
+                error="",
+            )
             logger.info(
-                "WB browser state | stage={} url={} title={} ready_state={} cookies_count={} token_present={} page_hint={}",
+                "WB browser state | stage={} url={} title={} ready_state={} cookies_count={} token_present={} document_cookie_len={} page_source_len={} page_hint={}",
                 stage,
                 current_url[:200],
                 title[:120],
                 ready_state,
                 len(cookies),
                 self.cookie_name in cookie_names,
+                document_cookie_len,
+                page_source_len,
                 page_hint,
             )
         except Exception as exc:
+            self._set_diagnostics(error=f"browser_state_logging_failed: {exc}")
             logger.warning("WB browser state logging failed: stage={} error={}", stage, exc)
+
+    def _set_diagnostics(self, **values: object) -> None:
+        """Persist the latest safe diagnostics for external smoke checks."""
+        self._last_diagnostics.update(values)
 
     def _get_ready_state(self, driver: object) -> str:
         """Return DOM readyState for safe diagnostics."""
@@ -236,6 +306,36 @@ class WbTokenProvider:
         if not fragments:
             return "no_known_markers"
         return ",".join(fragments)
+
+    def _get_page_source_len(self, driver: object) -> int:
+        """Return page source length for diagnostics."""
+        try:
+            return len(str(getattr(driver, "page_source", "") or ""))
+        except Exception:
+            return 0
+
+    def _get_document_cookie_len(self, driver: object) -> int:
+        """Return document.cookie length without logging cookie contents."""
+        try:
+            value = driver.execute_script("return document.cookie || ''")
+            return len(str(value or ""))
+        except Exception:
+            return 0
+
+    def _get_home_url(self) -> str:
+        """Return the WB homepage URL for warmup navigation."""
+        parsed = urlparse(self.url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/"
+        return "https://www.wildberries.ru/"
+
+    def _get_detail_page_url(self) -> str:
+        """Return a real WB product-card page for browser-context warmup."""
+        home_url = self._get_home_url().rstrip("/")
+        parsed = urlparse(self.DEFAULT_DETAIL_PAGE_URL)
+        if not parsed.path:
+            return self.DEFAULT_DETAIL_PAGE_URL
+        return f"{home_url}{parsed.path}"
 
     @staticmethod
     def _merge_cookies(*cookie_lists: list[dict]) -> list[dict]:

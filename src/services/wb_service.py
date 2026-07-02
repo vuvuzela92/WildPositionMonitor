@@ -31,14 +31,19 @@ from curl_cffi.requests.exceptions import Timeout
 from loguru import logger
 
 from src.config import (
+    WB_ALL_BUNDLES_498_COOLDOWN_ENABLED,
+    WB_ALL_BUNDLES_498_COOLDOWN_SECONDS,
     CONCURRENT_REQUESTS_LIMIT,
     WB_CIRCUIT_COOLDOWN,
     WB_PROXY_BUNDLES,
     WB_PROXY_BUNDLES_ENABLED,
+    WB_PROXY_ROTATE_EVERY,
+    WB_PROXY_ROTATE_ON_FIRST_FORBIDDEN,
     WB_PROXY_ROTATE_ON_CIRCUIT,
     WB_COOKIE,
     WB_COOKIE_ENABLED,
     WB_DEFAULT_DEST,
+    WB_DISABLE_BASKET_FALLBACK_ON_DETAIL_FORBIDDEN,
     WB_DETAIL_ENDPOINT_MODE,
     WB_DETAIL_URL,
     WB_DEVICE_ID,
@@ -94,6 +99,7 @@ class WildberriesService:
         self._session_lock = asyncio.Lock()
 
         self._session_inflight_by_generation: Dict[int, int] = {}
+        self._session_bundle_index_by_generation: Dict[int, int] = {}
         self._retired_sessions: Dict[int, AsyncSession] = {}
 
         self._session_rotations_total = 0
@@ -115,12 +121,19 @@ class WildberriesService:
         self.timeout = max(1, int(WB_TIMEOUT))
         self.detail_endpoint_mode = (WB_DETAIL_ENDPOINT_MODE or "card_v4").strip().lower()
         self._bundle_rotation_enabled = WB_PROXY_BUNDLES_ENABLED and bool(WB_PROXY_BUNDLES)
+        self._bundle_rotate_every = max(0, WB_PROXY_ROTATE_EVERY)
+        self._bundle_rotate_on_first_forbidden = WB_PROXY_ROTATE_ON_FIRST_FORBIDDEN
         self._bundle_rotate_on_circuit = WB_PROXY_ROTATE_ON_CIRCUIT
         self._proxy_bundles: List[WBProxyBundle] = list(WB_PROXY_BUNDLES)
         self._active_bundle_index = 0
         self._bundle_rotation_requested = False
         self._bundle_rotation_reason = ""
         self._bundle_rotations_total = 0
+        self._bundle_request_count = 0
+        self._bundle_498_cooldown_enabled = WB_ALL_BUNDLES_498_COOLDOWN_ENABLED
+        self._bundle_498_cooldown_seconds = max(60, WB_ALL_BUNDLES_498_COOLDOWN_SECONDS)
+        self._forbidden_498_bundle_indexes: Set[int] = set()
+        self._all_bundles_498_cooldowns_total = 0
         self._token_refresh_enabled = WB_TOKEN_AUTO_REFRESH_ENABLED
         self._token_refresh_lock = asyncio.Lock()
         self._cookie_manager: Optional[WbCookieManager] = None
@@ -286,8 +299,14 @@ class WildberriesService:
             return True
 
     def _has_next_bundle(self) -> bool:
-        """Возвращает `True`, если доступен следующий bundle."""
-        return self._bundle_rotation_enabled and self._active_bundle_index + 1 < len(self._proxy_bundles)
+        """Возвращает `True`, если доступно минимум два bundle для ротации."""
+        return self._bundle_rotation_enabled and len(self._proxy_bundles) > 1
+
+    def _get_next_bundle_index(self) -> int:
+        """Возвращает индекс следующего bundle по кольцу."""
+        if not self._proxy_bundles:
+            return 0
+        return (self._active_bundle_index + 1) % len(self._proxy_bundles)
 
     def _schedule_bundle_rotation(self, *, reason: str) -> None:
         """Планирует переключение на следующий bundle при следующем lease."""
@@ -301,12 +320,13 @@ class WildberriesService:
             return
         if self._bundle_rotation_requested:
             return
+        next_index = self._get_next_bundle_index()
         self._bundle_rotation_requested = True
         self._bundle_rotation_reason = reason
         self.logger.warning(
             "WB proxy bundle rotation scheduled: reason={} next_index={} total={}",
             reason,
-            self._active_bundle_index + 2,
+            next_index + 1,
             len(self._proxy_bundles),
         )
 
@@ -483,6 +503,7 @@ class WildberriesService:
         self._session_generation = new_generation
         self._session_request_count = 0
         self._session_inflight_by_generation.setdefault(new_generation, 0)
+        self._session_bundle_index_by_generation[new_generation] = self._active_bundle_index
         self._session_rotations_total += 1
         self._session_retired_max = max(self._session_retired_max, len(self._retired_sessions))
         self.logger.info(
@@ -500,9 +521,10 @@ class WildberriesService:
         old_session = self.session
         old_generation = self._session_generation
         old_bundle_index = self._active_bundle_index
+        next_bundle_index = self._get_next_bundle_index()
         reason = self._bundle_rotation_reason or "bundle_rotation_requested"
 
-        self._apply_bundle(old_bundle_index + 1, reason=reason)
+        self._apply_bundle(next_bundle_index, reason=reason)
         self._bundle_rotation_requested = False
         self._bundle_rotation_reason = ""
 
@@ -521,7 +543,9 @@ class WildberriesService:
         self.session = new_session
         self._session_generation = new_generation
         self._session_request_count = 0
+        self._bundle_request_count = 0
         self._session_inflight_by_generation.setdefault(new_generation, 0)
+        self._session_bundle_index_by_generation[new_generation] = self._active_bundle_index
         self._bundle_rotations_total += 1
         self._session_rotations_total += 1
         self._session_retired_max = max(self._session_retired_max, len(self._retired_sessions))
@@ -552,6 +576,15 @@ class WildberriesService:
             await self._rotate_bundle_if_needed()
 
             if count_for_rotation:
+                if self._bundle_rotation_enabled:
+                    self._bundle_request_count += 1
+                    if (
+                        self._bundle_rotate_every > 0
+                        and self._bundle_request_count >= self._bundle_rotate_every
+                    ):
+                        self._schedule_bundle_rotation(
+                            reason=f"bundle_rotate_every:{self._bundle_request_count}",
+                        )
                 self._session_request_count += 1
                 await self._rotate_session_if_needed()
 
@@ -624,11 +657,29 @@ class WildberriesService:
             "bundle_rotations_total": self._bundle_rotations_total,
             "bundle_active_index": self._active_bundle_index + 1 if self._proxy_bundles else 0,
             "bundle_total": len(self._proxy_bundles),
+            "forbidden_498_bundle_coverage": len(self._forbidden_498_bundle_indexes),
+            "all_bundles_498_cooldowns_total": self._all_bundles_498_cooldowns_total,
             "session_retired_total": len(self._retired_sessions),
             "session_retired_inflight_current": self._current_retired_inflight(),
             "session_retired_max": self._session_retired_max,
             "first_403_after_rotation_generation": self._first_403_after_rotation_generation,
         }
+
+    def is_global_burnout_active(self) -> bool:
+        """Возвращает True, если активен глобальный cooldown после выгорания всех bundle."""
+        return (
+            self.circuit_open_reason == "all_bundles_http_498"
+            and time.monotonic() < self.circuit_open_until
+        )
+
+    def build_global_burnout_result(self) -> WBRequestResult:
+        """Возвращает стандартный результат для быстрого отказа без нового HTTP-вызова."""
+        return WBRequestResult(
+            ok=False,
+            status_class="forbidden",
+            retriable=True,
+            error="global_burnout_circuit_open",
+        )
 
     async def _close_active_and_retired_sessions(self) -> None:
         """Закрывает active session и все retired sessions."""
@@ -640,6 +691,7 @@ class WildberriesService:
             self.session = None
             self._retired_sessions = {}
             self._session_inflight_by_generation = {}
+            self._session_bundle_index_by_generation = {}
 
         if active_session is not None:
             await active_session.close()
@@ -664,6 +716,7 @@ class WildberriesService:
         self._session_generation = 1
         self._session_request_count = 0
         self._session_inflight_by_generation = {1: 0}
+        self._session_bundle_index_by_generation = {1: self._active_bundle_index}
         self._retired_sessions = {}
         self.logger.info("Сервис WB инициализирован, создана постоянная async-сессия")
 
@@ -704,6 +757,15 @@ class WildberriesService:
         Возвращает:
         - `WBRequestResult` с payload и классификацией статуса.
         """
+        if self.is_global_burnout_active():
+            self.logger.warning(
+                "WB detail fast-failed by global burnout: request_id={} article_id={} cooldown_reason={}",
+                request_id,
+                product_id,
+                self.circuit_open_reason,
+            )
+            return self.build_global_burnout_result()
+
         detail_params = {
             "appType": 1,
             "curr": "rub",
@@ -740,6 +802,20 @@ class WildberriesService:
         if detail_response.ok:
             return detail_response
 
+        if (
+            self.detail_endpoint_mode == "u_card_v4"
+            and detail_response.status_class == "forbidden"
+            and WB_DISABLE_BASKET_FALLBACK_ON_DETAIL_FORBIDDEN
+        ):
+            self.logger.warning(
+                "Basket fallback skipped after detail forbidden: request_id={} article_id={} status_code={} error={}",
+                request_id,
+                product_id,
+                detail_response.status_code,
+                detail_response.error,
+            )
+            return detail_response
+
         basket_data = self._get_basket_data(product_id)
         basket_url = (
             f"https://basket-{basket_data['basket']}.wbbasket.ru/"
@@ -756,7 +832,7 @@ class WildberriesService:
             count_for_rotation=False,
         )
         try:
-            return await self._request_with_retry(
+            fallback_response = await self._request_with_retry(
                 url=basket_url,
                 endpoint="basket_card",
                 request_id=request_id,
@@ -764,6 +840,17 @@ class WildberriesService:
                 session=fallback_session,
                 session_generation=fallback_generation,
             )
+            if (
+                self.detail_endpoint_mode == "u_card_v4"
+                and detail_response.status_class == "forbidden"
+                and not fallback_response.ok
+            ):
+                upstream_error = detail_response.error or f"http_{detail_response.status_code or 'unknown'}"
+                fallback_error = fallback_response.error or "basket_fallback_error"
+                fallback_response.error = (
+                    f"{fallback_error}:detail_forbidden_before_fallback:{upstream_error}"
+                )
+            return fallback_response
         finally:
             await self._release_session_lease(fallback_generation)
 
@@ -1106,6 +1193,7 @@ class WildberriesService:
 
                 if status_class == "success":
                     self.consecutive_forbidden = 0
+                    self._reset_forbidden_498_bundle_coverage(reason="http_success")
                     self._close_circuit_if_half_open()
                     payload = response.json()
                     return WBRequestResult(
@@ -1162,6 +1250,13 @@ class WildberriesService:
                             continue
 
                 if status_class == "forbidden":
+                    self._mark_forbidden_498_bundle(
+                        endpoint=endpoint,
+                        status_code=status_code,
+                        session_generation=session_generation,
+                    )
+                    if self._bundle_rotate_on_first_forbidden:
+                        self._schedule_bundle_rotation(reason=f"first_forbidden:{status_code}")
                     self.consecutive_forbidden += 1
                     if (
                         self._session_generation > 1
@@ -1325,16 +1420,82 @@ class WildberriesService:
             return True
         return False
 
-    def _open_circuit(self, reason: str) -> None:
+    def _reset_forbidden_498_bundle_coverage(self, *, reason: str) -> None:
+        """Сбрасывает покрытие bundle по raw HTTP 498 после восстановления."""
+        if not self._forbidden_498_bundle_indexes:
+            return
+        self.logger.info(
+            "WB forbidden-498 bundle coverage reset: reason={} covered_bundles={} total_bundles={}",
+            reason,
+            len(self._forbidden_498_bundle_indexes),
+            len(self._proxy_bundles),
+        )
+        self._forbidden_498_bundle_indexes.clear()
+
+    def _mark_forbidden_498_bundle(
+        self,
+        *,
+        endpoint: str,
+        status_code: int,
+        session_generation: int,
+    ) -> None:
+        """Отмечает bundle, который дал raw HTTP 498 на u_card_detail_v4."""
+        if (
+            not self._bundle_498_cooldown_enabled
+            or endpoint != "u_card_detail_v4"
+            or status_code != 498
+            or not self._bundle_rotation_enabled
+            or not self._proxy_bundles
+        ):
+            return
+
+        bundle_index = self._session_bundle_index_by_generation.get(
+            session_generation,
+            self._active_bundle_index,
+        )
+        self._forbidden_498_bundle_indexes.add(bundle_index)
+        self.logger.warning(
+            "WB raw 498 bundle marked: bundle_index={} covered_bundles={} total_bundles={} generation={}",
+            bundle_index + 1,
+            len(self._forbidden_498_bundle_indexes),
+            len(self._proxy_bundles),
+            session_generation,
+        )
+
+        if len(self._forbidden_498_bundle_indexes) < len(self._proxy_bundles):
+            return
+
+        self._all_bundles_498_cooldowns_total += 1
+        self._bundle_rotation_requested = False
+        self._bundle_rotation_reason = ""
+        self._forbidden_498_bundle_indexes.clear()
+        self._open_circuit(
+            reason="all_bundles_http_498",
+            cooldown_seconds=self._bundle_498_cooldown_seconds,
+            rotate_bundle=False,
+        )
+
+    def _open_circuit(
+        self,
+        reason: str,
+        *,
+        cooldown_seconds: Optional[int] = None,
+        rotate_bundle: Optional[bool] = None,
+    ) -> None:
         """Открывает circuit breaker на cooldown-период."""
-        self.circuit_open_until = time.monotonic() + self.cooldown_seconds
-        self.circuit_open_reason = reason
+        effective_cooldown = max(1, int(cooldown_seconds or self.cooldown_seconds))
+        now = time.monotonic()
+        target_open_until = now + effective_cooldown
+        if target_open_until > self.circuit_open_until:
+            self.circuit_open_until = target_open_until
+            self.circuit_open_reason = reason
         self.half_open_probe_in_flight = False
-        if self._bundle_rotate_on_circuit:
+        should_rotate_bundle = self._bundle_rotate_on_circuit if rotate_bundle is None else rotate_bundle
+        if should_rotate_bundle:
             self._schedule_bundle_rotation(reason=reason)
         self.logger.warning(
             "Открыт circuit breaker WB: cooldown_s={} reason={}",
-            self.cooldown_seconds,
+            effective_cooldown,
             reason,
         )
 
@@ -1344,6 +1505,7 @@ class WildberriesService:
             self.circuit_open_until = 0.0
             self.circuit_open_reason = ""
             self.half_open_probe_in_flight = False
+            self._reset_forbidden_498_bundle_coverage(reason="half_open_success")
             self.logger.info("Circuit breaker WB закрыт после успешной half-open пробы")
 
     @staticmethod

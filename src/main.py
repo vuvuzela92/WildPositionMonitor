@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 from asyncio import to_thread
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from statistics import quantiles
@@ -51,6 +51,9 @@ from src.config import (
     POSTGRES_USER,
     WB_ALLOW_MISSING_PRODUCT,
     WB_ALLOW_MISSING_PRICE,
+    WB_BATCH_FORBIDDEN_STOP_LOSS_ENABLED,
+    WB_BATCH_FORBIDDEN_STOP_LOSS_MIN_BATCH_SIZE,
+    WB_BATCH_FORBIDDEN_STOP_LOSS_RATIO,
     WB_DETAIL_ENDPOINT_MODE,
     WB_ROLLOUT_ARTICLES_LIMIT,
     WB_DETAIL_SUBMIT_DELAY,
@@ -212,6 +215,8 @@ class WildPosition:
         self.checkpoint_store = CheckpointStore(CHECKPOINT_FILE_PATH)
         self.checkpoint_state = self.checkpoint_store.load()
         self.run_diagnostics = RunDiagnosticsState()
+        self.stop_loss_triggered = False
+        self.article_result_cache: Dict[int, ProcessingResult] = {}
 
     async def run(self, articles_data: List[Dict[str, Any]]) -> bool:
         """Запускает полный цикл мониторинга.
@@ -229,6 +234,8 @@ class WildPosition:
         - запись checkpoint и runtime-логов.
         """
         self._reset_run_diagnostics()
+        self.stop_loss_triggered = False
+        self.article_result_cache = {}
         self._set_run_stage("connect_postgres")
         logger.info("Запуск мониторинга WB, входных элементов={}", len(articles_data))
         try:
@@ -331,10 +338,24 @@ class WildPosition:
                 self._set_run_stage("log_batch_metrics")
                 self._log_batch_metrics(batch_num, total_batches, batch_results)
                 self.run_diagnostics.batch_metrics_logged = True
+                if self._should_stop_after_batch(batch_results):
+                    self.stop_loss_triggered = True
+                    logger.warning(
+                        "WB batch stop-loss triggered: batch_num={} total_batches={} action=stop_after_saved_batch",
+                        batch_num,
+                        total_batches,
+                    )
+                    break
 
             self._set_run_stage("final_metrics")
             self._log_final_metrics()
-            logger.info("Мониторинг WB завершен успешно, всего обработано={}", len(filtered_articles))
+            if self.stop_loss_triggered:
+                logger.warning(
+                    "Мониторинг WB завершён досрочно по stop-loss, prepared_articles={}",
+                    len(filtered_articles),
+                )
+            else:
+                logger.info("Мониторинг WB завершен успешно, всего обработано={}", len(filtered_articles))
             return True
         except asyncio.CancelledError:
             logger.exception(
@@ -507,17 +528,35 @@ class WildPosition:
             )
 
         tasks: List[asyncio.Task[ProcessingResult]] = []
+        in_batch_tasks_by_article_id: Dict[int, asyncio.Task[ProcessingResult]] = {}
         total_articles = len(articles_data)
         for index, article_info in enumerate(articles_data, start=1):
-            task = asyncio.create_task(
-                self._process_single_article(article_info, our_articles, batch_num=batch_num)
-            )
+            article_id = int(article_info["article_id"])
+            cached_result = self.article_result_cache.get(article_id)
+            if cached_result is not None:
+                task = asyncio.create_task(
+                    self._build_reused_result(article_info, cached_result, source="runtime_cache")
+                )
+            elif article_id in in_batch_tasks_by_article_id:
+                task = asyncio.create_task(
+                    self._await_and_clone_result(
+                        article_info=article_info,
+                        source_task=in_batch_tasks_by_article_id[article_id],
+                    )
+                )
+            else:
+                task = asyncio.create_task(
+                    self._process_single_article(article_info, our_articles, batch_num=batch_num)
+                )
+                in_batch_tasks_by_article_id[article_id] = task
             tasks.append(task)
 
             if WB_DETAIL_SUBMIT_DELAY > 0 and index < total_articles:
                 await asyncio.sleep(WB_DETAIL_SUBMIT_DELAY)
 
         results = await asyncio.gather(*tasks)
+        for result in results:
+            self.article_result_cache.setdefault(result.article_id, result)
         return results
 
     async def _process_single_article(
@@ -557,6 +596,43 @@ class WildPosition:
             batch_num,
         )
         try:
+            cached_result = self.article_result_cache.get(article_id)
+            if cached_result is not None:
+                logger.info(
+                    "Р”СѓР±Р»СЊ Р°СЂС‚РёРєСѓР»Р° РѕР±СЃР»СѓР¶РµРЅ РёР· runtime-РєСЌС€Р°: request_id={} task_key={} article_id={} cached_status={}",
+                    request_id,
+                    task_key,
+                    article_id,
+                    cached_result.status,
+                )
+                self._collect_cached_result_metrics(cached_result)
+                return self._clone_cached_result(
+                    cached_result=cached_result,
+                    task_key=task_key,
+                    wild=wild_value,
+                    competitor_status=competitor_status,
+                )
+
+            if self.wb_service.is_global_burnout_active():
+                logger.warning(
+                    "Обработка артикула быстро остановлена из-за global burnout: request_id={} task_key={} article_id={} batch_num={}",
+                    request_id,
+                    task_key,
+                    article_id,
+                    batch_num,
+                )
+                return self._remember_article_result(
+                    article_id,
+                    self._failed_result(
+                        article_id=article_id,
+                        task_key=task_key,
+                        status="forbidden",
+                        message="global_burnout_circuit_open",
+                        wild=wild_value,
+                        competitor_status=competitor_status,
+                    ),
+                )
+
             product_response = await self.wb_service.get_product_details(article_id, request_id=request_id)
             self._collect_http_metrics(product_response, stage="detail")
             if not product_response.ok:
@@ -757,6 +833,75 @@ class WildPosition:
             # Гарантируем очистку in_progress при любом исходе.
             self.checkpoint_state.in_progress.discard(task_key)
 
+    async def _build_reused_result(
+        self,
+        article_info: Dict[str, Any],
+        cached_result: ProcessingResult,
+        source: str,
+    ) -> ProcessingResult:
+        """Возвращает клон ранее полученного результата без нового HTTP-запроса."""
+        task_key = str(article_info.get("task_key") or build_task_key(article_info))
+        self.checkpoint_state.in_progress.add(task_key)
+        self.checkpoint_state.pending.discard(task_key)
+        try:
+            logger.info(
+                "Дубль артикула обслужен без нового HTTP-запроса: source={} task_key={} article_id={} cached_status={}",
+                source,
+                task_key,
+                cached_result.article_id,
+                cached_result.status,
+            )
+            self._collect_cached_result_metrics(cached_result)
+            return self._clone_cached_result(
+                cached_result=cached_result,
+                task_key=task_key,
+                wild=article_info.get("wild", ""),
+                competitor_status=article_info.get("competitor_status", ""),
+            )
+        finally:
+            self.checkpoint_state.in_progress.discard(task_key)
+
+    async def _await_and_clone_result(
+        self,
+        article_info: Dict[str, Any],
+        source_task: asyncio.Task[ProcessingResult],
+    ) -> ProcessingResult:
+        """Ждет первый task по article_id и переиспользует его результат для дубля."""
+        source_result = await source_task
+        return await self._build_reused_result(
+            article_info=article_info,
+            cached_result=source_result,
+            source="same_batch",
+        )
+
+    def _remember_article_result(self, article_id: int, result: ProcessingResult) -> ProcessingResult:
+        """Сохраняет результат по article_id для повторного использования в рамках прогона."""
+        self.article_result_cache[article_id] = result
+        return result
+
+    def _collect_cached_result_metrics(self, cached_result: ProcessingResult) -> None:
+        """Учитывает batch-метрики для дубля, обслуженного из runtime-кэша."""
+        if cached_result.status == "ok":
+            self.metrics.batch_successful_items += 1
+            return
+        self.metrics.batch_failed_items += 1
+
+    def _clone_cached_result(
+        self,
+        cached_result: ProcessingResult,
+        task_key: str,
+        wild: str,
+        competitor_status: str,
+    ) -> ProcessingResult:
+        """Клонирует ранее полученный результат под новый строковый контекст."""
+        return replace(
+            cached_result,
+            task_key=task_key,
+            processed_at=datetime.now(),
+            wild=wild,
+            concurrent=competitor_status,
+        )
+
     def _failed_result(
         self,
         article_id: int,
@@ -935,17 +1080,51 @@ class WildPosition:
             await self.wb_service.update_concurrency_limit(self.current_concurrency)
             logger.info("Повышен лимит конкурентности: new_limit={} ratio={:.2f}", self.current_concurrency, ratio)
 
+    @staticmethod
+    def _is_forbidden_like_result(result: ProcessingResult) -> bool:
+        """Возвращает True для результатов, завершившихся forbidden-ошибкой."""
+        error = (result.error or "").lower()
+        return "forbidden" in error
+
+    def _should_stop_after_batch(self, batch_results: List[ProcessingResult]) -> bool:
+        """Решает, нужно ли мягко остановить run после сохранённого batch."""
+        if not WB_BATCH_FORBIDDEN_STOP_LOSS_ENABLED or not batch_results:
+            return False
+
+        batch_total = len(batch_results)
+        if batch_total < WB_BATCH_FORBIDDEN_STOP_LOSS_MIN_BATCH_SIZE:
+            return False
+
+        forbidden_total = sum(1 for item in batch_results if self._is_forbidden_like_result(item))
+        forbidden_ratio = forbidden_total / max(1, batch_total)
+        if forbidden_ratio < WB_BATCH_FORBIDDEN_STOP_LOSS_RATIO:
+            return False
+
+        logger.warning(
+            "WB batch stop-loss condition met: batch_total={} forbidden_total={} forbidden_ratio={:.3f} threshold={:.3f} min_batch_size={}",
+            batch_total,
+            forbidden_total,
+            forbidden_ratio,
+            WB_BATCH_FORBIDDEN_STOP_LOSS_RATIO,
+            WB_BATCH_FORBIDDEN_STOP_LOSS_MIN_BATCH_SIZE,
+        )
+        return True
+
     def _log_batch_metrics(self, batch_num: int, total_batches: int, batch_results: List[ProcessingResult]) -> None:
         """Логирует метрики одного батча."""
         batch_total = len(batch_results)
         batch_success = sum(1 for item in batch_results if item.status == "ok")
         batch_ratio = batch_success / max(1, batch_total)
+        batch_forbidden = sum(1 for item in batch_results if self._is_forbidden_like_result(item))
+        batch_forbidden_ratio = batch_forbidden / max(1, batch_total)
         logger.info(
-            "Батч завершен: batch_num={} total_batches={} batch_total={} batch_success_ratio={:.3f} wb_concurrency_current={}",
+            "Батч завершен: batch_num={} total_batches={} batch_total={} batch_success_ratio={:.3f} batch_forbidden_total={} batch_forbidden_ratio={:.3f} wb_concurrency_current={}",
             batch_num,
             total_batches,
             batch_total,
             batch_ratio,
+            batch_forbidden,
+            batch_forbidden_ratio,
             self.current_concurrency,
         )
 

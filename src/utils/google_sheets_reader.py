@@ -2,21 +2,21 @@
 
 Модуль выполняет:
 - авторизацию service-account в Google API;
-- открытие рабочего листа;
-- чтение строк в pandas DataFrame;
+- открытие нужной таблицы и вкладки;
+- чтение строк листа;
 - нормализацию и валидацию поля артикула.
 
 WARNING:
-Текущая реализация синхронная (gspread + pandas) и вызывается из async-процесса.
-Менять её на асинхронную нужно отдельным анализом, чтобы не сломать
-существующий lifecycle и retry-поведение.
+Текущая реализация синхронная (gspread) и вызывается из async-процесса.
+Менять ее на асинхронную нужно отдельно, чтобы не сломать текущий lifecycle.
 """
+
+from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
-import pandas as pd
 from gspread import Client, Worksheet, service_account
 from loguru import logger
 
@@ -25,35 +25,38 @@ from src.config import (
     GOOGLE_MAX_RETRIES,
     GOOGLE_RETRY_DELAY,
     GOOGLE_SHEET_NAME,
+    GOOGLE_WORKSHEET_NAME,
 )
 
 
 class GoogleSheetsReader:
-    """Читает и подготавливает артикулы из Google Sheets."""
+    """Читает и подготавливает артикула из Google Sheets."""
 
-    def __init__(self):
-        """Инициализирует настройки источника и retry-параметры."""
+    REQUIRED_ARTICLE_COLUMN = "Артикул конкурента"
+    WILD_COLUMN = "wild"
+    COMPETITOR_STATUS_COLUMN = "Статус конкурента"
+    TARGET_COLUMNS = {
+        REQUIRED_ARTICLE_COLUMN,
+        WILD_COLUMN,
+        COMPETITOR_STATUS_COLUMN,
+    }
+
+    def __init__(self) -> None:
         self.logger = logger
         self.creds_path = GOOGLE_CREDS_PATH
         self.sheet_name = GOOGLE_SHEET_NAME
+        self.worksheet_name = GOOGLE_WORKSHEET_NAME
         self.max_retries = GOOGLE_MAX_RETRIES
         self.retry_delay = GOOGLE_RETRY_DELAY
 
         if not os.path.exists(self.creds_path):
-            self.logger.error("Файл учетных данных Google Sheets не найден: path={}", self.creds_path)
+            self.logger.error(
+                "Файл учетных данных Google Sheets не найден: path={}",
+                self.creds_path,
+            )
 
     def client_init_json(self) -> Optional[Client]:
-        """Инициализирует gspread client через service account.
-
-        Возвращает:
-        - объект `Client` при успехе;
-        - `None` после исчерпания retry.
-
-        Почему sync-retry:
-        - gspread здесь используется синхронно;
-        - метод вызывается до запуска интенсивной WB-части, поэтому простая
-          блокирующая задержка приемлема в текущей архитектуре.
-        """
+        """Инициализирует gspread client через service account."""
         retries = 0
         while retries < self.max_retries:
             try:
@@ -83,13 +86,8 @@ class GoogleSheetsReader:
                     return None
         return None
 
-    def connect_to_sheet(self, sheet_name: str) -> Tuple[Optional[Worksheet], Optional[str]]:
-        """Открывает worksheet по имени таблицы.
-
-        Возвращает:
-        - `(worksheet, None)` при успехе;
-        - `(None, error_message)` при неуспехе.
-        """
+    def connect_to_sheet(self, sheet_name: str) -> tuple[Optional[Worksheet], Optional[str]]:
+        """Открывает worksheet по имени таблицы и имени вкладки."""
         retries = 0
         while retries < self.max_retries:
             try:
@@ -98,23 +96,29 @@ class GoogleSheetsReader:
                     return None, "gsheets_client_not_initialized"
 
                 self.logger.info(
-                    "Открытие Google таблицы: sheet_name={} попытка {} из {}",
+                    "Открытие Google таблицы: sheet_name={} worksheet_name={} попытка {} из {}",
                     sheet_name,
+                    self.worksheet_name,
                     retries + 1,
                     self.max_retries,
                 )
                 sheet = client.open(sheet_name)
-                worksheet = sheet.get_worksheet(0)
+                worksheet = sheet.worksheet(self.worksheet_name)
                 if not worksheet:
-                    raise RuntimeError("worksheet_not_found")
+                    raise RuntimeError(f"worksheet_not_found:{self.worksheet_name}")
 
-                self.logger.info("Открытие Google таблицы: успешно sheet_name={}", sheet_name)
+                self.logger.info(
+                    "Открытие Google таблицы: успешно sheet_name={} worksheet_name={}",
+                    sheet_name,
+                    self.worksheet_name,
+                )
                 return worksheet, None
             except Exception as exc:
                 retries += 1
                 self.logger.warning(
-                    "Открытие Google таблицы не удалось: sheet_name={} попытка {} из {} retry_delay_s={} error={}",
+                    "Открытие Google таблицы не удалось: sheet_name={} worksheet_name={} попытка {} из {} retry_delay_s={} error={}",
                     sheet_name,
+                    self.worksheet_name,
                     retries,
                     self.max_retries,
                     self.retry_delay,
@@ -123,73 +127,153 @@ class GoogleSheetsReader:
                 if retries < self.max_retries:
                     time.sleep(self.retry_delay)
                 else:
-                    error_msg = f"Не удалось открыть Google таблицу: sheet_name={sheet_name} max_attempts={self.max_retries}"
+                    error_msg = (
+                        "Не удалось открыть Google таблицу: "
+                        f"sheet_name={sheet_name} worksheet_name={self.worksheet_name} "
+                        f"max_attempts={self.max_retries}"
+                    )
                     self.logger.exception("{} error={}", error_msg, exc)
                     return None, error_msg
         return None, "gsheets_open_unknown_failure"
 
-    def get_articles_from_sheet(self, sheet_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Читает артикулы и возвращает нормализованный список словарей.
-
-        Источник столбцов:
-        - обязательный: `Артикул конкурента`;
-        - опциональные: `wild`, `Статус конкурента`.
-
-        Возвращает:
-        - список элементов формата:
-          `{\"article_id\": int, \"wild\": str, \"competitor_status\": str}`.
-
-        WARNING:
-        Код опирается на текущий формат Google Sheets. Переименование столбцов
-        без синхронной правки здесь приведёт к пустому входу в мониторинг.
-        """
-        sheet_name = sheet_name or self.sheet_name
-        self.logger.info("Чтение Google таблицы: старт sheet_name={}", sheet_name)
+    def get_articles_from_sheet(self, sheet_name: Optional[str] = None) -> list[dict[str, Any]]:
+        """Читает артикула и возвращает нормализованный список словарей."""
+        target_sheet_name = sheet_name or self.sheet_name
+        self.logger.info(
+            "Чтение Google таблицы: старт sheet_name={} worksheet_name={}",
+            target_sheet_name,
+            self.worksheet_name,
+        )
         try:
-            worksheet, error = self.connect_to_sheet(sheet_name)
+            worksheet, error = self.connect_to_sheet(target_sheet_name)
             if not worksheet:
-                self.logger.error("Чтение Google таблицы: ошибка sheet_name={} error={}", sheet_name, error)
-                return []
-
-            all_data = worksheet.get_all_records()
-            df = pd.DataFrame(all_data)
-            self.logger.info("Чтение Google таблицы: успешно sheet_name={} rows={}", sheet_name, len(df))
-
-            source_col = "Артикул конкурента"
-            if source_col not in df.columns:
                 self.logger.error(
-                    "В Google таблице отсутствует обязательный столбец: column={} available_columns={}",
-                    source_col,
-                    list(df.columns),
+                    "Чтение Google таблицы: ошибка sheet_name={} worksheet_name={} error={}",
+                    target_sheet_name,
+                    self.worksheet_name,
+                    error,
                 )
                 return []
 
-            if "wild" not in df.columns:
-                self.logger.warning("В Google таблице отсутствует опциональный столбец: column=wild")
-            if "Статус конкурента" not in df.columns:
-                self.logger.warning("В Google таблице отсутствует опциональный столбец: column=Статус конкурента")
-
-            # Нормализуем артикулы в int64 и отбрасываем нечисловые значения.
-            df["Артикул"] = pd.to_numeric(df[source_col], errors="coerce")
-            df = df.dropna(subset=["Артикул"])
-            df["Артикул"] = df["Артикул"].astype("int64")
-
-            if len(df) == 0:
-                self.logger.warning("В Google таблице не найдено числовых артикулов: sheet_name={}", sheet_name)
+            rows = worksheet.get_all_values()
+            if not rows:
+                self.logger.warning(
+                    "В Google таблице нет данных: sheet_name={} worksheet_name={}",
+                    target_sheet_name,
+                    self.worksheet_name,
+                )
                 return []
 
-            result: List[Dict[str, Any]] = []
-            for _, row in df.iterrows():
-                result.append(
+            headers = [str(value).strip() for value in rows[0]]
+            header_indexes = self._build_header_indexes(headers)
+
+            if self.REQUIRED_ARTICLE_COLUMN not in header_indexes:
+                self.logger.error(
+                    "В Google таблице отсутствует обязательный столбец: column={} available_columns={}",
+                    self.REQUIRED_ARTICLE_COLUMN,
+                    headers,
+                )
+                return []
+
+            if self.WILD_COLUMN not in header_indexes:
+                self.logger.warning(
+                    "В Google таблице отсутствует опциональный столбец: column={}",
+                    self.WILD_COLUMN,
+                )
+            if self.COMPETITOR_STATUS_COLUMN not in header_indexes:
+                self.logger.warning(
+                    "В Google таблице отсутствует опциональный столбец: column={}",
+                    self.COMPETITOR_STATUS_COLUMN,
+                )
+
+            prepared_rows: list[dict[str, Any]] = []
+            skipped_empty_articles = 0
+            skipped_invalid_articles = 0
+            for row in rows[1:]:
+                raw_article = self._get_cell_value(
+                    row=row,
+                    header_indexes=header_indexes,
+                    column_name=self.REQUIRED_ARTICLE_COLUMN,
+                )
+                if raw_article == "":
+                    skipped_empty_articles += 1
+                    continue
+
+                article_id = self._parse_article_id(raw_article)
+                if article_id is None:
+                    skipped_invalid_articles += 1
+                    continue
+
+                prepared_rows.append(
                     {
-                        "article_id": int(row["Артикул"]),
-                        "wild": row.get("wild", "") if "wild" in df.columns else "",
-                        "competitor_status": row.get("Статус конкурента", "") if "Статус конкурента" in df.columns else "",
+                        "article_id": article_id,
+                        "wild": self._get_cell_value(
+                            row=row,
+                            header_indexes=header_indexes,
+                            column_name=self.WILD_COLUMN,
+                        ),
+                        "competitor_status": self._get_cell_value(
+                            row=row,
+                            header_indexes=header_indexes,
+                            column_name=self.COMPETITOR_STATUS_COLUMN,
+                        ),
                     }
                 )
 
-            self.logger.info("Артикулы из Google таблицы подготовлены: sheet_name={} count={}", sheet_name, len(result))
-            return result
+            if not prepared_rows:
+                self.logger.warning(
+                    "В Google таблице не найдено валидных артикулов: sheet_name={} worksheet_name={}",
+                    target_sheet_name,
+                    self.worksheet_name,
+                )
+                return []
+
+            self.logger.info(
+                "Артикулы из Google таблицы подготовлены: sheet_name={} worksheet_name={} count={} skipped_empty_articles={} skipped_invalid_articles={}",
+                target_sheet_name,
+                self.worksheet_name,
+                len(prepared_rows),
+                skipped_empty_articles,
+                skipped_invalid_articles,
+            )
+            return prepared_rows
         except Exception as exc:
-            self.logger.exception("Исключение при чтении Google таблицы: sheet_name={} error={}", sheet_name, exc)
+            self.logger.exception(
+                "Исключение при чтении Google таблицы: sheet_name={} worksheet_name={} error={}",
+                target_sheet_name,
+                self.worksheet_name,
+                exc,
+            )
             return []
+
+    def _build_header_indexes(self, headers: list[str]) -> dict[str, int]:
+        """Строит индекс нужных заголовков, игнорируя пустые и лишние колонки."""
+        header_indexes: dict[str, int] = {}
+        for index, header in enumerate(headers):
+            if not header or header not in self.TARGET_COLUMNS or header in header_indexes:
+                continue
+            header_indexes[header] = index
+        return header_indexes
+
+    @staticmethod
+    def _get_cell_value(
+        row: list[str],
+        header_indexes: dict[str, int],
+        column_name: str,
+    ) -> str:
+        """Безопасно возвращает строковое значение ячейки по имени колонки."""
+        column_index = header_indexes.get(column_name)
+        if column_index is None or column_index >= len(row):
+            return ""
+        return str(row[column_index]).strip()
+
+    @staticmethod
+    def _parse_article_id(raw_value: str) -> Optional[int]:
+        """Нормализует значение артикула из Google Sheets в int."""
+        normalized = raw_value.strip().replace(" ", "")
+        if not normalized:
+            return None
+        try:
+            return int(float(normalized))
+        except (TypeError, ValueError):
+            return None

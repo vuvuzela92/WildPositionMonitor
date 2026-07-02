@@ -38,7 +38,10 @@ EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", str(Path(EXCEL_DIR) / "Артик
 DATA_SOURCE = os.getenv("DATA_SOURCE", "excel")
 
 # Параметры Google Sheets.
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Конкурентный анализ Вектор")
+# Имя production-таблицы и рабочей вкладки фиксированы в коде, чтобы
+# источник данных не зависел от локального `.env` и порядка листов.
+GOOGLE_SHEET_NAME = "UNIT 2.0 (tested)"
+GOOGLE_WORKSHEET_NAME = "Конкуренты"
 GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", str(BASE_DIR / "creds.json"))
 
 # Логирование и checkpoint.
@@ -73,6 +76,9 @@ WB_DEFAULT_DEST = os.getenv("WB_DEFAULT_DEST", "-1257786")
 WB_DETAIL_ENDPOINT_MODE = os.getenv("WB_DETAIL_ENDPOINT_MODE", "card_v4")
 WB_ALLOW_MISSING_PRICE = os.getenv("WB_ALLOW_MISSING_PRICE", "False").lower() == "true"
 WB_ALLOW_MISSING_PRODUCT = os.getenv("WB_ALLOW_MISSING_PRODUCT", "False").lower() == "true"
+WB_DISABLE_BASKET_FALLBACK_ON_DETAIL_FORBIDDEN = (
+    os.getenv("WB_DISABLE_BASKET_FALLBACK_ON_DETAIL_FORBIDDEN", "False").lower() == "true"
+)
 
 # Таймаут запроса (сек). Влияет на время ожидания curl_cffi AsyncSession.
 WB_TIMEOUT = int(os.getenv("WB_TIMEOUT", "10"))
@@ -82,6 +88,16 @@ WB_DEVICE_ID = os.getenv("WB_DEVICE_ID", "")
 WB_PROXY_URL = os.getenv("WB_PROXY_URL", "")
 WB_PROXY_BUNDLES_ENABLED = os.getenv("WB_PROXY_BUNDLES_ENABLED", "False").lower() == "true"
 WB_PROXY_ROTATE_ON_CIRCUIT = os.getenv("WB_PROXY_ROTATE_ON_CIRCUIT", "True").lower() == "true"
+WB_PROXY_ROTATE_EVERY = int(os.getenv("WB_PROXY_ROTATE_EVERY", "0"))
+WB_PROXY_ROTATE_ON_FIRST_FORBIDDEN = (
+    os.getenv("WB_PROXY_ROTATE_ON_FIRST_FORBIDDEN", "True").lower() == "true"
+)
+WB_ALL_BUNDLES_498_COOLDOWN_ENABLED = (
+    os.getenv("WB_ALL_BUNDLES_498_COOLDOWN_ENABLED", "False").lower() == "true"
+)
+WB_ALL_BUNDLES_498_COOLDOWN_SECONDS = int(
+    os.getenv("WB_ALL_BUNDLES_498_COOLDOWN_SECONDS", "300")
+)
 WB_TOKEN_AUTO_REFRESH_ENABLED = os.getenv("WB_TOKEN_AUTO_REFRESH_ENABLED", "False").lower() == "true"
 WB_TOKEN_COOKIE_NAME = os.getenv("WB_TOKEN_COOKIE_NAME", "x_wbaas_token")
 WB_TOKEN_REFRESH_URL = os.getenv("WB_TOKEN_REFRESH_URL", "https://www.wildberries.ru/")
@@ -119,6 +135,13 @@ WB_SAFE_REQUEST_DELAY = float(os.getenv("WB_SAFE_REQUEST_DELAY", "0.25"))
 WB_ROLLOUT_ARTICLES_LIMIT = int(os.getenv("WB_ROLLOUT_ARTICLES_LIMIT", "0"))
 WB_DETAIL_SUBMIT_DELAY = float(os.getenv("WB_DETAIL_SUBMIT_DELAY", "0"))
 WB_SKIP_SIMILAR_STAGE = os.getenv("WB_SKIP_SIMILAR_STAGE", "False").lower() == "true"
+WB_BATCH_FORBIDDEN_STOP_LOSS_ENABLED = (
+    os.getenv("WB_BATCH_FORBIDDEN_STOP_LOSS_ENABLED", "False").lower() == "true"
+)
+WB_BATCH_FORBIDDEN_STOP_LOSS_RATIO = float(os.getenv("WB_BATCH_FORBIDDEN_STOP_LOSS_RATIO", "0.35"))
+WB_BATCH_FORBIDDEN_STOP_LOSS_MIN_BATCH_SIZE = int(
+    os.getenv("WB_BATCH_FORBIDDEN_STOP_LOSS_MIN_BATCH_SIZE", "20")
+)
 
 # Батчинг и конкурентность.
 # WARNING: повышение значений без A/B-проверки может изменить timing profile
